@@ -14,6 +14,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Funciones de deteccion (is_cloudflare_ip, match_blocked_ip, find_blocks...)
+# shellcheck source=lib/ip-match.sh
+source "${SCRIPT_DIR}/lib/ip-match.sh"
+
 # --- Cargar configuracion ---------------------------------------------------
 
 ENV_FILE="${SCRIPT_DIR}/.env"
@@ -31,7 +35,7 @@ LOCK_FILE="${SCRIPT_DIR}/state/toggle-proxy.lock"
 DRY_RUN="${DRY_RUN:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-HAYAHORA_API="https://hayahora.futbol/estado/data.json"
+HAYAHORA_API="${HAYAHORA_API:-https://hayahora.futbol/estado/data.json}"
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 # Dominios protegidos: NUNCA se les quita el proxy/CDN
@@ -84,53 +88,6 @@ is_protected_domain() {
     return 1
 }
 
-# Comprobar si una IP pertenece a los rangos de Cloudflare
-# Usa los rangos publicados en cloudflare.com/ips
-is_cloudflare_ip() {
-    local ip="$1"
-
-    # IPv6: comprobar prefijos conocidos de Cloudflare
-    if [[ "$ip" == *:* ]]; then
-        local cf6_prefixes="2400:cb00 2606:4700 2803:f800 2405:b500 2405:8100 2a06:98c 2c0f:f248"
-        for prefix in $cf6_prefixes; do
-            [[ "$ip" == ${prefix}* ]] && return 0
-        done
-        return 1
-    fi
-
-    # IPv4: extraer primer y segundo octeto y comprobar contra rangos CIDR conocidos
-    local oct1 oct2 oct3
-    IFS='.' read -r oct1 oct2 oct3 _ <<< "$ip"
-
-    # Rangos Cloudflare IPv4 (de cloudflare.com/ips-v4):
-    # 103.21.244.0/22, 103.22.200.0/22, 103.31.4.0/22
-    # 104.16.0.0/13 (104.16-23.x.x), 104.24.0.0/14 (104.24-27.x.x)
-    # 108.162.192.0/18
-    # 131.0.72.0/22
-    # 141.101.64.0/18
-    # 162.158.0.0/15 (162.158-159.x.x)
-    # 172.64.0.0/13 (172.64-71.x.x)
-    # 173.245.48.0/20
-    # 188.114.96.0/20 (188.114.96-111.x.x)
-    # 190.93.240.0/20
-    # 197.234.240.0/22
-    # 198.41.128.0/17 (198.41.128-255.x.x)
-    case "$oct1" in
-        103) [[ "$oct2" -eq 21 || "$oct2" -eq 22 || "$oct2" -eq 31 ]] && return 0 ;;
-        104) [[ "$oct2" -ge 16 && "$oct2" -le 27 ]] && return 0 ;;
-        108) [[ "$oct2" -eq 162 ]] && return 0 ;;
-        131) [[ "$oct2" -eq 0 && "$oct3" -ge 72 && "$oct3" -le 75 ]] && return 0 ;;
-        141) [[ "$oct2" -eq 101 ]] && return 0 ;;
-        162) [[ "$oct2" -ge 158 && "$oct2" -le 159 ]] && return 0 ;;
-        172) [[ "$oct2" -ge 64 && "$oct2" -le 71 ]] && return 0 ;;
-        173) [[ "$oct2" -eq 245 ]] && return 0 ;;
-        188) [[ "$oct2" -eq 114 && "$oct3" -ge 96 && "$oct3" -le 111 ]] && return 0 ;;
-        190) [[ "$oct2" -eq 93 ]] && return 0 ;;
-        197) [[ "$oct2" -eq 234 ]] && return 0 ;;
-        198) [[ "$oct2" -eq 41 && "$oct3" -ge 128 ]] && return 0 ;;
-    esac
-    return 1
-}
 
 # Escritura atomica: escribe a tmp y luego mv (previene corrupcion por crash)
 atomic_write() {
@@ -235,8 +192,99 @@ cf_api() {
     echo "$body"
 }
 
+
 # =============================================================================
-# PASO 1: Resolver IPs de nuestros dominios y comprobar contra hayahora.futbol
+# Helpers de dominios, state e IPs guardadas
+# =============================================================================
+
+# Resolvers y subredes de ISPs espanoles (ECS) para descubrir las IPs anycast
+# de Cloudflare que ven los usuarios en Espana. Cloudflare devuelve IPs
+# compartidas distintas segun resolver y ubicacion: desde un servidor fuera de
+# Espana un "dig" a secas no ve las mismas que reciben Movistar, DIGI, etc.
+DNS_RESOLVERS="1.1.1.1 8.8.8.8 9.9.9.9"
+ECS_RESOLVER="8.8.8.8"
+# Movistar, Vodafone, Orange, DIGI, MasMovil
+ES_ECS_SUBNETS="80.58.0.0/16 62.37.0.0/16 90.160.0.0/16 79.116.0.0/16 37.29.0.0/16"
+
+CF_IPS_FILE="${STATE_FILE%.json}_ips.json"
+
+# Filtro jq: registros del state que pertenecen a un dominio de DOMAINS.
+# Las entradas nuevas llevan "domain"; las antiguas se asignan por nombre.
+STATE_MINE_JQ='def mine($zid; $d):
+    .zone_id == $zid
+    and ((.domain // null) == $d
+         or ((.domain // null) == null and (.name == $d or (.name | endswith("." + $d)))));'
+
+dig_short() {
+    dig +short +time=2 +tries=1 "$@" 2>/dev/null || true
+}
+
+# Conjunto de IPs candidatas (solo Cloudflare, sin duplicados) de un dominio:
+# union de dig del sistema, resolvers publicos y Google con ECS de ISPs
+# espanoles, para A y AAAA.
+resolve_candidates() {
+    local domain="$1" type r sub ip
+    {
+        for type in A AAAA; do
+            dig_short "$domain" "$type"
+            for r in $DNS_RESOLVERS; do
+                dig_short "@${r}" "$domain" "$type"
+            done
+            for sub in $ES_ECS_SUBNETS; do
+                dig_short "@${ECS_RESOLVER}" "+subnet=${sub}" "$domain" "$type"
+            done
+        done
+    } | while IFS= read -r ip; do
+        if [[ -n "$ip" ]] && is_cloudflare_ip "$ip"; then
+            echo "$ip"
+        fi
+    done | sort -u
+}
+
+# Numero de registros en el state file que pertenecen al dominio
+domain_state_count() {
+    read_state | jq --arg zid "$1" --arg d "$2" "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))] | length'
+}
+
+# Leer el archivo de IPs guardadas ({} si no existe o esta corrupto).
+# Formato actual: {"dominio": ["ip", ...]}. Formato antiguo: ["ip", ...].
+read_ips_file() {
+    if [[ -f "$CF_IPS_FILE" ]] && [[ -s "$CF_IPS_FILE" ]]; then
+        jq -c '.' "$CF_IPS_FILE" 2>/dev/null || echo '{}'
+    else
+        echo '{}'
+    fi
+}
+
+# IPs de Cloudflare guardadas para un dominio (una por linea, vacio si no hay)
+saved_ips_for() {
+    read_ips_file | jq -r --arg d "$1" '
+        if type == "array" then .[]
+        elif type == "object" then (.[$d] // [])[]
+        else empty end'
+}
+
+# Guardar las IPs candidatas de un dominio (antes de quitarle el proxy)
+save_ips_for() {
+    local domain="$1" ips_json="$2" all_json new
+    all_json="$(printf '%s\n' "${DOMAIN_NAMES[@]}" | jq -R . | jq -s .)"
+    new="$(read_ips_file | jq -c --arg d "$domain" --argjson ips "$ips_json" --argjson all "$all_json" '
+        (if type == "object" then .
+         elif type == "array" then (. as $old | reduce $all[] as $x ({}; .[$x] = $old))
+         else {} end)
+        | .[$d] = $ips')" && atomic_write "$CF_IPS_FILE" "$new"
+}
+
+# Olvidar las IPs guardadas de un dominio (tras rehabilitarlo)
+forget_ips_for() {
+    local new
+    [[ -f "$CF_IPS_FILE" ]] || return 0
+    new="$(read_ips_file | jq -c --arg d "$1" 'if type == "object" then del(.[$d]) else . end')" \
+        && atomic_write "$CF_IPS_FILE" "$new"
+}
+
+# =============================================================================
+# PASO 1: Consultar hayahora.futbol
 # =============================================================================
 
 _all_prot="${PROTECTED_DOMAINS_BUILTIN}"
@@ -244,67 +292,27 @@ _all_prot="${PROTECTED_DOMAINS_BUILTIN}"
 log "INFO" "Dominios protegidos (nunca se quita CDN): ${_all_prot}"
 log "INFO" "Comprobando estado de bloqueos LaLiga para nuestros dominios..."
 
-# Si ya deshabilitamos el proxy, dig devuelve las IPs de origen (no las de Cloudflare).
-# En ese caso, usar las IPs de Cloudflare guardadas en el state file.
-existing_state="$(read_state)"
-existing_state_len="$(echo "$existing_state" | jq 'length')"
-
-CF_IPS_FILE="${STATE_FILE%.json}_ips.json"
-if [[ "$existing_state_len" -gt 0 ]] && [[ -f "$CF_IPS_FILE" ]] && [[ -s "$CF_IPS_FILE" ]]; then
-    # Proxy deshabilitado: usar las IPs de Cloudflare guardadas (no las de origen)
-    our_ips=()
-    while IFS= read -r ip; do
-        [[ -n "$ip" ]] && our_ips+=("$ip")
-    done < <(jq -r '.[]' "$CF_IPS_FILE" 2>/dev/null)
-    log "INFO" "Usando IPs de Cloudflare guardadas (proxy deshabilitado)"
-elif [[ "$existing_state_len" -gt 0 ]]; then
-    # State file existe pero NO hay archivo de IPs (script antiguo).
-    # dig devolveria IPs de origen, no las de Cloudflare -> no fiable.
-    # Fallback: comprobar si hay CUALQUIER bloqueo de Cloudflare activo.
-    log "WARN" "State file sin IPs guardadas (version antigua). Usando check amplio de Cloudflare."
-    our_ips=("__CHECK_ALL_CLOUDFLARE__")
-else
-    # Sin state file: resolver IPs frescas con dig y filtrar solo Cloudflare
-    IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS"
-    our_ips=()
-
-    for entry in "${DOMAIN_LIST[@]}"; do
-        entry="$(echo "$entry" | xargs)"
-        domain="${entry#*:}"
-        if [[ -z "$domain" ]]; then continue; fi
-
-        while IFS= read -r ip; do
-            if [[ -n "$ip" ]] && is_cloudflare_ip "$ip"; then
-                our_ips+=("$ip")
-            fi
-        done < <(dig +short "$domain" A 2>/dev/null)
-        while IFS= read -r ip; do
-            if [[ -n "$ip" ]] && is_cloudflare_ip "$ip"; then
-                our_ips+=("$ip")
-            fi
-        done < <(dig +short "$domain" AAAA 2>/dev/null)
-    done
-
-    if [[ ${#our_ips[@]} -eq 0 ]]; then
-        log "WARN" "Ninguna IP resuelta es de Cloudflare. El proxy podria estar desactivado manualmente."
-        log "INFO" "Abortando. Si el proxy esta activo, comprueba la configuracion de DNS."
-        exit 0
+# Parsear DOMAINS (ZONE_ID:DOMINIO,...) en dos arrays paralelos
+IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS"
+ZONE_IDS=()
+DOMAIN_NAMES=()
+for entry in "${DOMAIN_LIST[@]}"; do
+    entry="$(echo "$entry" | xargs)"
+    [[ -z "$entry" ]] && continue
+    zone_id="${entry%%:*}"
+    domain="${entry#*:}"
+    if [[ "$entry" != *:* || -z "$zone_id" || -z "$domain" ]]; then
+        log "ERROR" "Entrada mal formada en DOMAINS: '$entry'. Formato: ZONE_ID:DOMINIO"
+        continue
     fi
-fi
+    ZONE_IDS+=("$zone_id")
+    DOMAIN_NAMES+=("$domain")
+done
 
-# Eliminar duplicados (compatible bash 3)
-our_ips_dedup=()
-while IFS= read -r ip; do
-    [[ -n "$ip" ]] && our_ips_dedup+=("$ip")
-done < <(printf '%s\n' "${our_ips[@]}" | sort -u)
-our_ips=("${our_ips_dedup[@]}")
-
-if [[ ${#our_ips[@]} -eq 0 ]]; then
-    log "ERROR" "No se pudieron resolver IPs para ningun dominio. Abortando."
+if [[ ${#DOMAIN_NAMES[@]} -eq 0 ]]; then
+    log "ERROR" "DOMAINS no contiene ninguna entrada valida. Abortando."
     exit 1
 fi
-
-log "INFO" "IPs a comprobar: ${our_ips[*]}"
 
 MAX_DISABLED_SECONDS="${MAX_DISABLED_HOURS:-12}"
 MAX_DISABLED_SECONDS=$((MAX_DISABLED_SECONDS * 3600))
@@ -316,336 +324,157 @@ if [[ "$hayahora_ok" == "true" ]] && ! echo "$hayahora_data" | jq empty 2>/dev/n
     hayahora_ok=false
 fi
 
-if [[ "$hayahora_ok" == "false" ]]; then
+if [[ "$hayahora_ok" == "true" ]]; then
+    # Entradas con bloqueo activo ("ip<TAB>isp"), calculadas una sola vez
+    hayahora_active="$(echo "$hayahora_data" | jq -r "$HAYAHORA_ACTIVE_JQ")"
+    # Para state files antiguos sin IPs guardadas: cualquier bloqueo de Cloudflare
+    cf_blocked_count="$(echo "$hayahora_data" | jq '
+        [.data[]
+         | select(.description | test("^Cloudflare"))
+         | select(.stateChanges | length > 0)
+         | select(.stateChanges[-1].state == true)
+        ] | length
+    ')"
+    log "INFO" "hayahora.futbol: $(echo "$hayahora_data" | jq "[${HAYAHORA_ACTIVE_JQ}] | length") entrada(s) con bloqueo activo"
+else
     log "WARN" "No se pudo obtener datos de $HAYAHORA_API"
-
-    # Comprobar si hay state file con registros deshabilitados hace mas de MAX_DISABLED_HOURS
-    current_state="$(read_state)"
-    state_len="$(echo "$current_state" | jq 'length')"
-
-    if [[ "$state_len" -eq 0 ]]; then
+    if [[ "$(read_state | jq 'length')" -eq 0 ]]; then
         log "INFO" "Sin state file activo. Abortando sin cambios (fail-safe)."
         exit 0
     fi
-
-    # Comprobar antiguedad del primer registro deshabilitado
-    oldest_ts="$(echo "$current_state" | jq -r '.[0].disabled_at')"
-    # disabled_at puede ser epoch (numerico) o ISO 8601 (legacy)
-    if [[ "$oldest_ts" =~ ^[0-9]+$ ]]; then
-        oldest_epoch="$oldest_ts"
-    else
-        oldest_epoch="$(date -d "$oldest_ts" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$oldest_ts" +%s 2>/dev/null || echo "")"
-    fi
-    # Si no se pudo parsear, no asumir timeout -- esperar
-    if [[ -z "$oldest_epoch" || "$oldest_epoch" == "0" ]]; then
-        log "WARN" "No se pudo parsear disabled_at='$oldest_ts'. Esperando sin cambios."
-        exit 0
-    fi
-    now_epoch="$(date +%s)"
-    elapsed=$(( now_epoch - oldest_epoch ))
-
-    if [[ "$elapsed" -ge "$MAX_DISABLED_SECONDS" ]]; then
-        log "WARN" "Proxy deshabilitado hace $(( elapsed / 3600 ))h. Superado limite de ${MAX_DISABLED_HOURS:-12}h. Rehabilitando."
-        blocking_active=false
-        blocked_details="(hayahora caida, timeout ${MAX_DISABLED_HOURS:-12}h alcanzado)"
-    else
-        remaining_h=$(( (MAX_DISABLED_SECONDS - elapsed) / 3600 ))
-        log "INFO" "Proxy deshabilitado hace $(( elapsed / 3600 ))h. Quedan ~${remaining_h}h hasta rehabilitar por timeout. Esperando."
-        exit 0
-    fi
-else
-    # Hayahora funciona: comprobar bloqueo
-    if [[ "${our_ips[0]}" == "__CHECK_ALL_CLOUDFLARE__" ]]; then
-        # Fallback: sin IPs guardadas, comprobar CUALQUIER bloqueo de Cloudflare
-        blocked_count="$(echo "$hayahora_data" | jq '
-            [.data[]
-             | select(.description | test("^Cloudflare"))
-             | select(.stateChanges | length > 0)
-             | select(.stateChanges[-1].state == true)
-            ] | length
-        ')"
-
-        if [[ "$blocked_count" -gt 0 ]]; then
-            blocking_active=true
-            blocked_details="(check amplio: $blocked_count IPs de Cloudflare bloqueadas)"
-            log "WARN" "BLOQUEO CLOUDFLARE ACTIVO ($blocked_count IPs bloqueadas). Manteniendo proxy deshabilitado."
-        else
-            blocking_active=false
-            log "INFO" "No hay bloqueos de Cloudflare activos. Se puede rehabilitar."
-        fi
-    else
-        our_ips_json="$(printf '%s\n' "${our_ips[@]}" | jq -R . | jq -s .)"
-
-        blocked_count="$(echo "$hayahora_data" | jq --argjson ours "$our_ips_json" '
-            [.data[]
-             | select(.ip as $ip | $ours | index($ip))
-             | select(.stateChanges | length > 0)
-             | select(.stateChanges[-1].state == true)
-            ] | length
-        ')"
-
-        if [[ "$blocked_count" -gt 0 ]]; then
-            blocking_active=true
-
-            blocked_details="$(echo "$hayahora_data" | jq -r --argjson ours "$our_ips_json" '
-                [.data[]
-                 | select(.ip as $ip | $ours | index($ip))
-                 | select(.stateChanges | length > 0)
-                 | select(.stateChanges[-1].state == true)
-                 | "\(.isp) bloqueando \(.ip)"
-                ] | join("; ")
-            ')"
-
-            log "WARN" "BLOQUEO DE NUESTRAS IPs ($blocked_count entradas): $blocked_details"
-        else
-            blocking_active=false
-            log "INFO" "Nuestras IPs NO estan bloqueadas"
-        fi
-    fi
 fi
 
 # =============================================================================
-# PASO 2: Leer estado actual y decidir accion
+# PASO 2 y 3: Decidir y actuar dominio a dominio
 # =============================================================================
 
-current_state="$(read_state)"
-state_count="$(echo "$current_state" | jq 'length')"
-script_disabled_proxy=false
-if [[ "$state_count" -gt 0 ]]; then
-    script_disabled_proxy=true
-fi
+any_error=false
+total_disabled=0
+total_reapplied=0
+reapplied_names=""
+disable_reasons=""
+restored_lines=""
+total_restored=0
+enable_reasons=""
 
-# Matriz de decision:
-#   blocking=true  + state=false → DISABLE (primer bloqueo)
-#   blocking=true  + state=true  → DISABLE (retomar tras crash, saltara los ya hechos)
-#   blocking=false + state=true  → ENABLE
-#   blocking=false + state=false → nada
-if [[ "$blocking_active" == "true" ]]; then
-    action="disable"
-elif [[ "$blocking_active" == "false" && "$script_disabled_proxy" == "true" ]]; then
-    action="enable"
-else
-    log "INFO" "Sin bloqueo y proxy activo. Sin accion."
-    exit 0
-fi
+# Quitar el proxy a los registros proxied de un dominio
+disable_domain() {
+    local zone_id="$1" domain="$2"
 
-# En modo DRY_RUN: solo informar y salir
-if [[ "$DRY_RUN" == "true" ]]; then
-    if [[ "$action" == "disable" ]]; then
-        # Mostrar dominios protegidos que se saltarian
-        IFS=',' read -ra _dry_domains <<< "$DOMAINS"
-        _dry_skip=""
-        for _de in "${_dry_domains[@]}"; do
-            _dd="${_de#*:}"
-            if is_protected_domain "$_dd"; then
-                _dry_skip="${_dry_skip}${_dd}, "
-            fi
-        done
-        if [[ -n "$_dry_skip" ]]; then
-            log "DRY_RUN" "Dominios PROTEGIDOS (no se tocaran): ${_dry_skip%, }"
-        fi
-
-        if [[ "$script_disabled_proxy" == "true" ]]; then
-            log "DRY_RUN" "Bloqueo activo. Ya hay $state_count registro(s) deshabilitado(s). Se comprobarian los restantes."
-        else
-            log "DRY_RUN" "ACCION NECESARIA: Hay bloqueo activo. Se DESHABILITARIA el proxy para: $(echo "$DOMAINS" | tr ',' '\n' | cut -d: -f2 | tr '\n' ', ')"
-        fi
-    else
-        log "DRY_RUN" "ACCION NECESARIA: Bloqueo terminado. Se REHABILITARIA el proxy en $state_count registro(s)."
-    fi
-    log "DRY_RUN" "No se ha modificado nada en Cloudflare (modo prueba)"
-    exit 0
-fi
-
-# =============================================================================
-# PASO 3: Ejecutar accion
-# =============================================================================
-
-IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS"
-
-if [[ "$action" == "disable" ]]; then
-    # -----------------------------------------------------------------
-    # DESHABILITAR PROXY
-    # -----------------------------------------------------------------
-    log "INFO" "=== DESHABILITANDO proxy de Cloudflare ==="
-
-    # Guardar las IPs de Cloudflare actuales (antes de cambiar el proxy)
-    # Se usaran en siguientes ejecuciones para comprobar si el bloqueo sigue
-    our_ips_save="$(printf '%s\n' "${our_ips[@]}" | jq -R . | jq -s .)"
-    atomic_write "${STATE_FILE%.json}_ips.json" "$our_ips_save"
+    log "INFO" "=== DESHABILITANDO proxy de Cloudflare: $domain (zona: ${zone_id:0:8}...) ==="
 
     # Inicializar state file si no existe
     if [[ ! -f "$STATE_FILE" ]] || [[ ! -s "$STATE_FILE" ]]; then
         atomic_write "$STATE_FILE" '[]'
     fi
 
-    any_error=false
-    total_disabled=0
-    total_reapplied=0
-    reapplied_names=""
+    local records_json target_records record_count i record record_id record_name
+    local record_type record_content record_ttl body new_state
 
-    for entry in "${DOMAIN_LIST[@]}"; do
-        entry="$(echo "$entry" | xargs)"
-        zone_id="${entry%%:*}"
-        domain="${entry#*:}"
+    records_json="$(cf_api GET "/zones/${zone_id}/dns_records?per_page=100")" || {
+        log "ERROR" "No se pudieron obtener registros DNS para $domain. Saltando."
+        any_error=true
+        return 0
+    }
 
-        if [[ -z "$zone_id" || -z "$domain" ]]; then
-            log "ERROR" "Entrada mal formada en DOMAINS: '$entry'. Formato: ZONE_ID:DOMINIO"
-            any_error=true
+    # Solo registros proxied del dominio y subdominios
+    target_records="$(echo "$records_json" | jq -c --arg domain "$domain" '
+        [.result[]
+         | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
+         | select(.name == $domain or (.name | endswith("." + $domain)))
+         | select(.proxiable == true)
+         | select(.proxied == true)
+         | {id, name, type, content, ttl}
+        ]
+    ')"
+
+    record_count="$(echo "$target_records" | jq 'length')"
+
+    if [[ "$record_count" -eq 0 ]]; then
+        log "INFO" "  No hay registros proxied para $domain."
+        return 0
+    fi
+
+    log "INFO" "  $record_count registro(s) proxied encontrado(s)"
+
+    for i in $(seq 0 $((record_count - 1))); do
+        record="$(echo "$target_records" | jq -c ".[$i]")"
+        record_id="$(echo "$record" | jq -r '.id')"
+        record_name="$(echo "$record" | jq -r '.name')"
+        record_type="$(echo "$record" | jq -r '.type')"
+        record_content="$(echo "$record" | jq -r '.content')"
+        record_ttl="$(echo "$record" | jq '.ttl')"
+
+        # PROTECCION: nunca deshabilitar proxy en dominios protegidos
+        if is_protected_domain "$record_name"; then
+            log "WARN" "  [PROTEGIDO] $record_name esta en la lista de dominios protegidos. NO se tocara."
             continue
         fi
 
-        log "INFO" "Procesando dominio: $domain (zona: ${zone_id:0:8}...)"
+        body="$(jq -n \
+            --arg name "$record_name" \
+            --arg type "$record_type" \
+            --arg content "$record_content" \
+            --argjson ttl "$record_ttl" \
+            '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: false}'
+        )"
 
-        records_json="$(cf_api GET "/zones/${zone_id}/dns_records?per_page=100")" || {
-            log "ERROR" "No se pudieron obtener registros DNS para $domain. Saltando."
-            any_error=true
-            continue
-        }
-
-        # Solo registros proxied del dominio y subdominios
-        target_records="$(echo "$records_json" | jq -c --arg domain "$domain" '
-            [.result[]
-             | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
-             | select(.name == $domain or (.name | endswith("." + $domain)))
-             | select(.proxiable == true)
-             | select(.proxied == true)
-             | {id, name, type, content, ttl}
-            ]
-        ')"
-
-        record_count="$(echo "$target_records" | jq 'length')"
-
-        if [[ "$record_count" -eq 0 ]]; then
-            log "INFO" "  No hay registros proxied para $domain."
+        # Si ya esta en state file pero vuelve a estar proxied, alguien (o algo)
+        # ha reactivado la nube naranja durante el bloqueo: hay que volver a
+        # quitarla. Antes se saltaba y la web se quedaba caida todo el partido.
+        if jq -e --arg id "$record_id" '.[] | select(.record_id == $id)' "$STATE_FILE" >/dev/null 2>&1; then
+            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
+                log "WARN" "  [REAPLICADO] $record_name estaba en state file pero alguien reactivo el proxy. Quitado de nuevo."
+                total_reapplied=$((total_reapplied + 1))
+                reapplied_names="${reapplied_names}  - ${record_name}"$'\n'
+            else
+                log "ERROR" "  [FAIL] No se pudo volver a deshabilitar proxy para $record_type $record_name"
+                any_error=true
+            fi
             continue
         fi
 
-        log "INFO" "  $record_count registro(s) proxied encontrado(s)"
+        if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
+            log "INFO" "  [OK] Proxy deshabilitado: $record_type $record_name -> $record_content"
+            total_disabled=$((total_disabled + 1))
 
-        for i in $(seq 0 $((record_count - 1))); do
-            record="$(echo "$target_records" | jq -c ".[$i]")"
-            record_id="$(echo "$record" | jq -r '.id')"
-            record_name="$(echo "$record" | jq -r '.name')"
-            record_type="$(echo "$record" | jq -r '.type')"
-            record_content="$(echo "$record" | jq -r '.content')"
-            record_ttl="$(echo "$record" | jq '.ttl')"
-
-            # PROTECCION: nunca deshabilitar proxy en dominios protegidos
-            if is_protected_domain "$record_name"; then
-                log "WARN" "  [PROTEGIDO] $record_name esta en la lista de dominios protegidos. NO se tocara."
-                continue
-            fi
-
-            # Si ya esta en state file pero vuelve a estar proxied, alguien (o algo)
-            # ha reactivado la nube naranja durante el bloqueo: hay que volver a
-            # quitarla. Antes se saltaba y la web se quedaba caida todo el partido.
-            if jq -e --arg id "$record_id" '.[] | select(.record_id == $id)' "$STATE_FILE" >/dev/null 2>&1; then
-                reapply_body="$(jq -n \
-                    --arg name "$record_name" \
-                    --arg type "$record_type" \
-                    --arg content "$record_content" \
-                    --argjson ttl "$record_ttl" \
-                    '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: false}'
-                )"
-                if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$reapply_body" >/dev/null; then
-                    log "WARN" "  [REAPLICADO] $record_name estaba en state file pero alguien reactivo el proxy. Quitado de nuevo."
-                    total_reapplied=$((total_reapplied + 1))
-                    reapplied_names="${reapplied_names}  - ${record_name}"$'\n'
-                else
-                    log "ERROR" "  [FAIL] No se pudo volver a deshabilitar proxy para $record_type $record_name"
-                    any_error=true
-                fi
-                continue
-            fi
-
-            patch_body="$(jq -n \
+            # Guardar en state file INMEDIATAMENTE tras cada PATCH exitoso
+            new_state="$(jq \
+                --arg zid "$zone_id" \
+                --arg domain "$domain" \
+                --arg id "$record_id" \
                 --arg name "$record_name" \
                 --arg type "$record_type" \
                 --arg content "$record_content" \
-                --argjson ttl "$record_ttl" \
-                '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: false}'
-            )"
-
-            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$patch_body" >/dev/null; then
-                log "INFO" "  [OK] Proxy deshabilitado: $record_type $record_name -> $record_content"
-                total_disabled=$((total_disabled + 1))
-
-                # Guardar en state file INMEDIATAMENTE tras cada PATCH exitoso
-                new_state="$(jq \
-                    --arg zid "$zone_id" \
-                    --arg id "$record_id" \
-                    --arg name "$record_name" \
-                    --arg type "$record_type" \
-                    --arg content "$record_content" \
-                    --argjson ts "$(date +%s)" \
-                    '. + [{zone_id: $zid, record_id: $id, name: $name, type: $type, content: $content, disabled_at: $ts}]' \
-                    "$STATE_FILE" 2>/dev/null)" && atomic_write "$STATE_FILE" "$new_state" || {
-                    log "ERROR" "  No se pudo actualizar state file para $record_name"
-                    any_error=true
-                }
-            else
-                log "ERROR" "  [FAIL] No se pudo deshabilitar proxy para $record_type $record_name"
+                --argjson ts "$(date +%s)" \
+                '. + [{zone_id: $zid, domain: $domain, record_id: $id, name: $name, type: $type, content: $content, disabled_at: $ts}]' \
+                "$STATE_FILE" 2>/dev/null)" && atomic_write "$STATE_FILE" "$new_state" || {
+                log "ERROR" "  No se pudo actualizar state file para $record_name"
                 any_error=true
-            fi
-        done
+            }
+        else
+            log "ERROR" "  [FAIL] No se pudo deshabilitar proxy para $record_type $record_name"
+            any_error=true
+        fi
     done
+}
 
-    final_count="$(jq 'length' "$STATE_FILE" 2>/dev/null || echo 0)"
-    log "INFO" "Total en state file: $final_count registro(s) ($total_disabled nuevos en esta ejecucion)"
+# Restaurar el proxy en los registros que este script quito a un dominio
+enable_domain() {
+    local zone_id="$1" domain="$2"
 
-    # Notificar por Telegram solo si hubo cambios nuevos
-    if [[ "$total_disabled" -gt 0 ]]; then
-        records_list="$(jq -r '.[] | "  - \(.type) \(.name) → \(.content)"' "$STATE_FILE" 2>/dev/null)"
-        notify_telegram "$(cat <<EOF
-🔴 <b>Proxy Cloudflare DESHABILITADO</b>
+    log "INFO" "=== REHABILITANDO proxy de Cloudflare: $domain (zona: ${zone_id:0:8}...) ==="
 
-LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $final_count registro(s):
+    local state_records record_count i record_id record_name record_type
+    local record_content record_ttl current current_proxied body new_state remaining
 
-<code>$records_list</code>
-
-Motivo: $blocked_details
-EOF
-)"
-    fi
-
-    if [[ "$total_reapplied" -gt 0 ]]; then
-        notify_telegram "$(cat <<EOF
-⚠️ <b>Alguien reactivo el proxy de Cloudflare durante el bloqueo</b>
-
-Se ha vuelto a quitar (naranja → gris) en $total_reapplied registro(s):
-
-<code>${reapplied_names}</code>
-EOF
-)"
-    fi
-
-    if [[ "$any_error" == "true" ]]; then
-        log "WARN" "Algunos registros fallaron. Se reintentara en la proxima ejecucion."
-    fi
-
-elif [[ "$action" == "enable" ]]; then
-    # -----------------------------------------------------------------
-    # REHABILITAR PROXY
-    # -----------------------------------------------------------------
-    log "INFO" "=== REHABILITANDO proxy de Cloudflare ==="
-
-    state_records="$(read_state)"
+    state_records="$(read_state | jq -c --arg zid "$zone_id" --arg d "$domain" \
+        "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))]')"
     record_count="$(echo "$state_records" | jq 'length')"
 
-    if [[ "$record_count" -eq 0 ]]; then
-        log "INFO" "State file vacio. Nada que rehabilitar."
-        rm -f "$STATE_FILE" "${STATE_FILE%.json}_ips.json"
-        exit 0
-    fi
-
-    log "INFO" "Restaurando $record_count registro(s) deshabilitado(s) previamente"
-
-    any_error=false
-    total_enabled=0
+    log "INFO" "  Restaurando $record_count registro(s) deshabilitado(s) previamente"
 
     for i in $(seq 0 $((record_count - 1))); do
-        zone_id="$(echo "$state_records" | jq -r ".[$i].zone_id")"
         record_id="$(echo "$state_records" | jq -r ".[$i].record_id")"
         record_name="$(echo "$state_records" | jq -r ".[$i].name")"
 
@@ -665,7 +494,7 @@ elif [[ "$action" == "enable" ]]; then
             record_content="$(echo "$current" | jq -r '.result.content')"
             record_ttl="$(echo "$current" | jq '.result.ttl')"
 
-            patch_body="$(jq -n \
+            body="$(jq -n \
                 --arg name "$record_name" \
                 --arg type "$record_type" \
                 --arg content "$record_content" \
@@ -673,9 +502,8 @@ elif [[ "$action" == "enable" ]]; then
                 '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: true}'
             )"
 
-            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$patch_body" >/dev/null; then
+            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
                 log "INFO" "  [OK] Proxy rehabilitado: $record_type $record_name"
-                total_enabled=$((total_enabled + 1))
             else
                 log "ERROR" "  [FAIL] No se pudo rehabilitar proxy para $record_name"
                 any_error=true
@@ -691,24 +519,206 @@ elif [[ "$action" == "enable" ]]; then
         }
     done
 
-    # Si el state file quedo vacio, eliminarlo
-    remaining="$(jq 'length' "$STATE_FILE" 2>/dev/null || echo 0)"
+    remaining="$(domain_state_count "$zone_id" "$domain")"
     if [[ "$remaining" -eq 0 ]]; then
-        rm -f "$STATE_FILE" "${STATE_FILE%.json}_ips.json"
-        log "INFO" "Todos los registros restaurados. State file eliminado."
+        forget_ips_for "$domain"
+        log "INFO" "  Todos los registros de $domain restaurados."
+        total_restored=$((total_restored + record_count))
+        restored_lines="${restored_lines}$(echo "$state_records" | jq -r '.[] | "  - \(.type) \(.name)"')"$'\n'
+    else
+        log "WARN" "  $remaining registro(s) de $domain no se pudieron rehabilitar. Se reintentara en la proxima ejecucion."
+    fi
+}
 
-        restored_list="$(echo "$state_records" | jq -r '.[] | "  - \(.type) \(.name)"')"
-        notify_telegram "$(cat <<EOF
-🟢 <b>Proxy Cloudflare REHABILITADO</b>
+checked_domains=0
 
-El bloqueo de LaLiga ha terminado. Se ha restaurado el proxy (nube gris → naranja) en $record_count registro(s):
+for idx in "${!DOMAIN_NAMES[@]}"; do
+    zone_id="${ZONE_IDS[$idx]}"
+    domain="${DOMAIN_NAMES[$idx]}"
+    state_n="$(domain_state_count "$zone_id" "$domain")"
 
-<code>$restored_list</code>
+    log "INFO" "--- $domain ---"
+
+    # 1. IPs candidatas. Si ya quitamos el proxy, dig devuelve las IPs de origen:
+    #    usar las IPs de Cloudflare guardadas al deshabilitarlo.
+    legacy_check=false
+    if [[ "$state_n" -gt 0 ]]; then
+        candidates="$(saved_ips_for "$domain")"
+        if [[ -n "$candidates" ]]; then
+            log "INFO" "  Proxy deshabilitado ($state_n registro(s)). Usando IPs de Cloudflare guardadas."
+        else
+            # State sin IPs guardadas (version antigua): check amplio de Cloudflare
+            log "WARN" "  State sin IPs guardadas para $domain (version antigua). Usando check amplio de Cloudflare."
+            legacy_check=true
+        fi
+    else
+        candidates="$(resolve_candidates "$domain")"
+        if [[ -z "$candidates" ]]; then
+            log "WARN" "  Ninguna IP resuelta de $domain es de Cloudflare. El proxy podria estar desactivado manualmente. Sin accion."
+            continue
+        fi
+    fi
+    checked_domains=$((checked_domains + 1))
+    [[ "$legacy_check" == "false" ]] && log "INFO" "  IPs candidatas: $(echo "$candidates" | tr '\n' ' ')"
+
+    # 2. Decidir
+    blocked=false
+    reason=""
+    if [[ "$hayahora_ok" == "true" ]]; then
+        if [[ "$legacy_check" == "true" ]]; then
+            if [[ "$cf_blocked_count" -gt 0 ]]; then
+                blocked=true
+                reason="check amplio: $cf_blocked_count IPs de Cloudflare bloqueadas"
+                log "WARN" "  BLOQUEO CLOUDFLARE ACTIVO ($cf_blocked_count IPs bloqueadas). Manteniendo proxy deshabilitado."
+            else
+                log "INFO" "  No hay bloqueos de Cloudflare activos. Se puede rehabilitar."
+            fi
+        else
+            matches="$(printf '%s\n' "$hayahora_active" | find_blocks "$candidates")"
+            if [[ -n "$matches" ]]; then
+                blocked=true
+                match_count=0
+                while IFS=$'\t' read -r m_isp m_ip m_rule m_cand; do
+                    if [[ "$m_rule" == "exact" ]]; then
+                        log "WARN" "  [exact] $m_isp bloquea $m_ip (IP nuestra)"
+                    else
+                        log "WARN" "  [$m_rule] $m_isp bloquea $m_ip (mismo bloque que nuestra $m_cand)"
+                    fi
+                    [[ -n "$reason" ]] && reason="${reason}; "
+                    reason="${reason}${m_isp} bloqueando ${m_ip} (${m_rule})"
+                    match_count=$((match_count + 1))
+                done <<< "$matches"
+                log "WARN" "  BLOQUEO DE $domain ($match_count entradas)"
+            else
+                log "INFO" "  Nuestras IPs de $domain NO estan bloqueadas"
+            fi
+        fi
+    else
+        # hayahora caida: solo importa el timeout de los registros ya deshabilitados
+        if [[ "$state_n" -eq 0 ]]; then
+            log "INFO" "  hayahora caida y proxy activo. Sin accion (fail-safe)."
+            continue
+        fi
+        oldest_ts="$(read_state | jq -r --arg zid "$zone_id" --arg d "$domain" \
+            "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))][0].disabled_at')"
+        # disabled_at puede ser epoch (numerico) o ISO 8601 (legacy)
+        if [[ "$oldest_ts" =~ ^[0-9]+$ ]]; then
+            oldest_epoch="$oldest_ts"
+        else
+            oldest_epoch="$(date -d "$oldest_ts" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$oldest_ts" +%s 2>/dev/null || echo "")"
+        fi
+        # Si no se pudo parsear, no asumir timeout -- esperar
+        if [[ -z "$oldest_epoch" || "$oldest_epoch" == "0" ]]; then
+            log "WARN" "  No se pudo parsear disabled_at='$oldest_ts'. Esperando sin cambios."
+            continue
+        fi
+        elapsed=$(( $(date +%s) - oldest_epoch ))
+        if [[ "$elapsed" -lt "$MAX_DISABLED_SECONDS" ]]; then
+            remaining_h=$(( (MAX_DISABLED_SECONDS - elapsed) / 3600 ))
+            log "INFO" "  Proxy deshabilitado hace $(( elapsed / 3600 ))h. Quedan ~${remaining_h}h hasta rehabilitar por timeout. Esperando."
+            continue
+        fi
+        log "WARN" "  Proxy deshabilitado hace $(( elapsed / 3600 ))h. Superado limite de ${MAX_DISABLED_HOURS:-12}h. Rehabilitando."
+        reason="hayahora caida, timeout ${MAX_DISABLED_HOURS:-12}h alcanzado"
+    fi
+
+    # 3. Actuar. Matriz por dominio:
+    #   bloqueado + sin state  -> DISABLE (primer bloqueo)
+    #   bloqueado + con state  -> DISABLE (retomar tras crash / reaplicar)
+    #   libre     + con state  -> ENABLE
+    #   libre     + sin state  -> nada
+    if [[ "$blocked" == "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            if is_protected_domain "$domain"; then
+                log "DRY_RUN" "  $domain bloqueado pero PROTEGIDO: no se tocaria."
+            elif [[ "$state_n" -gt 0 ]]; then
+                log "DRY_RUN" "  Bloqueo activo. Ya hay $state_n registro(s) deshabilitado(s) en $domain. Se comprobarian los restantes."
+            else
+                log "DRY_RUN" "  ACCION NECESARIA: se DESHABILITARIA el proxy de $domain"
+            fi
+            continue
+        fi
+        # Guardar las IPs de Cloudflare actuales (antes de cambiar el proxy)
+        # para comprobar en siguientes ejecuciones si el bloqueo sigue
+        if [[ "$legacy_check" == "false" ]]; then
+            save_ips_for "$domain" "$(echo "$candidates" | jq -R . | jq -sc .)"
+        fi
+        disable_domain "$zone_id" "$domain"
+        disable_reasons="${disable_reasons}${domain}: ${reason}"$'\n'
+    elif [[ "$state_n" -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "DRY_RUN" "  ACCION NECESARIA: bloqueo terminado. Se REHABILITARIA el proxy en $state_n registro(s) de $domain."
+            continue
+        fi
+        enable_domain "$zone_id" "$domain"
+        [[ -n "$reason" ]] && enable_reasons="${enable_reasons}${domain}: ${reason}"$'\n'
+    else
+        log "INFO" "  Sin bloqueo y proxy activo. Sin accion."
+    fi
+done
+
+if [[ "$checked_domains" -eq 0 ]]; then
+    log "INFO" "Ningun dominio con IPs de Cloudflare que comprobar. Si el proxy esta activo, comprueba la configuracion de DNS."
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log "DRY_RUN" "No se ha modificado nada en Cloudflare (modo prueba)"
+    exit 0
+fi
+
+# =============================================================================
+# PASO 4: Resumen, limpieza y notificaciones
+# =============================================================================
+
+final_count="$(read_state | jq 'length')"
+if [[ "$final_count" -eq 0 ]] && [[ -f "$STATE_FILE" || -f "$CF_IPS_FILE" ]]; then
+    rm -f "$STATE_FILE" "$CF_IPS_FILE"
+    log "INFO" "Todos los registros restaurados. State file eliminado."
+fi
+
+if [[ "$total_disabled" -gt 0 ]]; then
+    log "INFO" "Total en state file: $final_count registro(s) ($total_disabled nuevos en esta ejecucion)"
+    records_list="$(jq -r '.[] | "  - \(.type) \(.name) → \(.content)"' "$STATE_FILE" 2>/dev/null)"
+    notify_telegram "$(cat <<EOF
+🔴 <b>Proxy Cloudflare DESHABILITADO</b>
+
+LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $final_count registro(s):
+
+<code>$records_list</code>
+
+Motivo:
+${disable_reasons}
 EOF
 )"
-    else
-        log "WARN" "$remaining registro(s) no se pudieron rehabilitar. Se reintentara en la proxima ejecucion."
-    fi
+fi
+
+if [[ "$total_reapplied" -gt 0 ]]; then
+    notify_telegram "$(cat <<EOF
+⚠️ <b>Alguien reactivo el proxy de Cloudflare durante el bloqueo</b>
+
+Se ha vuelto a quitar (naranja → gris) en $total_reapplied registro(s):
+
+<code>${reapplied_names}</code>
+EOF
+)"
+fi
+
+if [[ "$total_restored" -gt 0 ]]; then
+    notify_telegram "$(cat <<EOF
+🟢 <b>Proxy Cloudflare REHABILITADO</b>
+
+El bloqueo de LaLiga ha terminado. Se ha restaurado el proxy (nube gris → naranja) en $total_restored registro(s):
+
+<code>${restored_lines}</code>
+${enable_reasons:+
+Motivo:
+${enable_reasons}}
+EOF
+)"
+fi
+
+if [[ "$any_error" == "true" ]]; then
+    log "WARN" "Algunos registros fallaron. Se reintentara en la proxima ejecucion."
 fi
 
 log "INFO" "Hecho."

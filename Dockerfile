@@ -5,6 +5,7 @@ RUN apk add --no-cache bash curl jq bind-tools
 WORKDIR /app
 
 COPY toggle-proxy.sh entrypoint.sh ./
+COPY lib ./lib
 RUN chmod +x toggle-proxy.sh entrypoint.sh
 
 RUN mkdir -p /app/logs /app/state
