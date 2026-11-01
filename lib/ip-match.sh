@@ -160,6 +160,14 @@ html_escape() {
     printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+# Cuerpo JSON para sendMessage de Telegram. jq codifica el texto, asi que
+# "&", "=" o saltos de linea no pueden inyectar campos. El HTML del texto
+# debe venir ya escapado con html_escape.
+telegram_payload() {
+    jq -nc --arg chat_id "$1" --arg text "$2" \
+        '{chat_id: $chat_id, text: $text, parse_mode: "HTML"}'
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)

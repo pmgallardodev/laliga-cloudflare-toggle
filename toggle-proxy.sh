@@ -58,11 +58,17 @@ log() {
 notify_telegram() {
     local message="$1"
     if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+        # Cuerpo JSON (no -d campo=valor): un "&" en el texto no puede partir
+        # el mensaje en campos de formulario extra
+        local payload
+        payload="$(telegram_payload "$TELEGRAM_CHAT_ID" "$message")" || {
+            log "WARN" "No se pudo construir la notificacion de Telegram"
+            return 0
+        }
         curl -s --max-time 10 \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d parse_mode="HTML" \
-            -d text="$message" >/dev/null 2>&1 || {
+            -H 'Content-Type: application/json' \
+            --data-binary "$payload" >/dev/null 2>&1 || {
             log "WARN" "No se pudo enviar notificacion de Telegram"
         }
     fi

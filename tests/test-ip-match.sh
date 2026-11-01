@@ -90,6 +90,16 @@ evil_fixture='{"data":[{"ip":"188.114.96.5","isp":"<a href=\"https://evil\">x</a
 evil_isp="$(echo "$evil_fixture" | jq -r "$HAYAHORA_ACTIVE_JQ" | find_blocks "188.114.96.2" | cut -f1)"
 check "html_escape: isp malicioso del feed" '&lt;a href="https://evil"&gt;x&lt;/a&gt;' "$(html_escape "$evil_isp")"
 
+# --- telegram_payload: cuerpo JSON, sin inyeccion de campos ---
+evil_text="$(printf 'a & parse_mode=Markdown&chat_id=666 "q" \\ <b>\nlinea2')"
+payload="$(telegram_payload "-1001" "$evil_text")"
+check "telegram_payload: JSON valido con 3 campos" "chat_id,parse_mode,text" \
+    "$(echo "$payload" | jq -r 'keys | join(",")')"
+check "telegram_payload: texto intacto (round-trip)" "$evil_text" "$(echo "$payload" | jq -r '.text')"
+check "telegram_payload: chat_id y parse_mode no inyectables" "-1001 HTML" \
+    "$(echo "$payload" | jq -r '"\(.chat_id) \(.parse_mode)"')"
+check "telegram_payload: una sola linea" "1" "$(printf '%s\n' "$payload" | wc -l | xargs)"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]
