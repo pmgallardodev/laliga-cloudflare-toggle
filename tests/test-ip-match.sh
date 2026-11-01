@@ -79,6 +79,17 @@ check "find_blocks: solo bloqueos activos y vecinos" "$expected" "$actual"
 actual="$(echo "$fixture" | jq -r "$HAYAHORA_ACTIVE_JQ" | find_blocks "172.67.1.1")"
 check "find_blocks: sin match" "" "$actual"
 
+# --- html_escape para Telegram (parse_mode=HTML) ---
+check "html_escape: & < >" "&lt;b&gt;DIGI&lt;/b&gt; &amp; Co" "$(html_escape '<b>DIGI</b> & Co')"
+check "html_escape: no re-escapa &amp;" "&amp;amp;" "$(html_escape '&amp;')"
+check "html_escape: texto normal intacto" "DIGI bloqueando 188.114.96.5 (same24)" \
+    "$(html_escape 'DIGI bloqueando 188.114.96.5 (same24)')"
+check "html_escape: multilinea" "$(printf 'a &lt;x&gt;\nb')" "$(html_escape "$(printf 'a <x>\nb')")"
+# isp malicioso del feed: find_blocks lo devuelve tal cual, el escape lo neutraliza
+evil_fixture='{"data":[{"ip":"188.114.96.5","isp":"<a href=\"https://evil\">x</a>","stateChanges":[{"state":true}]}]}'
+evil_isp="$(echo "$evil_fixture" | jq -r "$HAYAHORA_ACTIVE_JQ" | find_blocks "188.114.96.2" | cut -f1)"
+check "html_escape: isp malicioso del feed" '&lt;a href="https://evil"&gt;x&lt;/a&gt;' "$(html_escape "$evil_isp")"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]

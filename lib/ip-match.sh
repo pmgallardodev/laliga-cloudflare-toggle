@@ -152,6 +152,14 @@ match_blocked_ip() {
     return 1
 }
 
+# Escapar texto para mensajes de Telegram con parse_mode=HTML.
+# Todo valor externo (feed de hayahora, nombres de dominio y registros) pasa
+# por aqui antes de componer el mensaje. & primero para no re-escapar.
+# sed y no ${var//&/...}: en bash >= 5.2 "&" en el reemplazo es el match.
+html_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)

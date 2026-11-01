@@ -684,10 +684,10 @@ if [[ "$total_disabled" -gt 0 ]]; then
 
 LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $final_count registro(s):
 
-<code>$records_list</code>
+<code>$(html_escape "$records_list")</code>
 
 Motivo:
-${disable_reasons}
+$(html_escape "$disable_reasons")
 EOF
 )"
 fi
@@ -698,7 +698,7 @@ if [[ "$total_reapplied" -gt 0 ]]; then
 
 Se ha vuelto a quitar (naranja → gris) en $total_reapplied registro(s):
 
-<code>${reapplied_names}</code>
+<code>$(html_escape "$reapplied_names")</code>
 EOF
 )"
 fi
@@ -709,10 +709,10 @@ if [[ "$total_restored" -gt 0 ]]; then
 
 El bloqueo de LaLiga ha terminado. Se ha restaurado el proxy (nube gris → naranja) en $total_restored registro(s):
 
-<code>${restored_lines}</code>
+<code>$(html_escape "$restored_lines")</code>
 ${enable_reasons:+
 Motivo:
-${enable_reasons}}
+$(html_escape "$enable_reasons")}
 EOF
 )"
 fi
