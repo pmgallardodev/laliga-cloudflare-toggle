@@ -244,6 +244,17 @@ t_feed_null_description() {
     ok "check amplio (sin IPs guardadas) con description null" '[[ $RC == 0 ]] && out_has "No hay bloqueos de Cloudflare activos"'
 }
 
+# --- T7: CIDR exacto ------------------------------------------------------------
+
+t_cidr_origin_not_cloudflare() {
+    setup cidr-origin-not-cloudflare
+    records "[$(rec r1 example.test false A 108.162.1.2),$(rec r2 www.example.test true)]"
+    dns example.test A 108.162.1.2
+    feed 108.162.1.9:ISP
+    run_app
+    ok "IP fuera de 108.162.192.0/18 no es candidata: nada se toca" '[[ $(patches r2) == 0 ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

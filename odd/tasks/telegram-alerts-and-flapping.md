@@ -44,7 +44,7 @@ The user authorized fixing all findings, then commit and push of this branch (20
 - [x] T6: validate the feed. Require an HTTP 2xx, a non-empty body, `.data` as an array, string `ip`/`isp`,
       a nullable `description`, and `stateChanges` as an array of objects. Any invalid response follows the
       unavailable-feed timeout path, and no jq call can crash the run.
-- [ ] T7: CIDR correctness. Do exact numeric membership for every published Cloudflare IPv4/IPv6 range,
+- [x] T7: CIDR correctness. Do exact numeric membership for every published Cloudflare IPv4/IPv6 range,
       with boundary tests.
 - [ ] T8: numeric env parsing. Base 10 with bounds for `MIN_CLEAR_MINUTES`, `MAX_DISABLED_HOURS`,
       `CHECK_INTERVAL` and persisted epochs (`08` must work).
@@ -123,3 +123,4 @@ change). Each entry lists the commit and the observed checks.
   current code: 20 ok / 0 fallos on both shells (GREEN by design; it pins existing behaviour). Also
   silences the 2 pre-existing shellcheck warnings with directives (SC1090 `.env`, SC2034).
 - T6 `<T6>` fix(feed): validate hayahora responses. `feed_is_valid` (jq -se, one object, typed fields) RED: `command not found` (13 unit checks failed / 4 passed by accident), integration 18 of 23 failed (exit 5 on `{"error":..}`, data null/string, object stateChanges, null description; empty body treated as healthy). GREEN: unit 67/0, integration 43/0 on bash 5 and 3.2. Feed fetched with `curl -sf` so HTTP >= 400 is unavailable; null description tolerated in the broad check. shellcheck clean, `bash -n` ok, scratch harness 23/0.
+- T7 `<T7>` fix(cidr): exact numeric membership. RED: unit aborted (`CF_IPV4_RANGES: unbound variable`), integration `cidr-origin-not-cloudflare` failed (www PATCHed for a 108.162.1.x origin). GREEN: unit 169/0 (first/last/just-outside for all 15 v4 and 7 v6 ranges, 104.16/13 and 104.24/14 adjacency handled), integration 44/0, both shells. Single list `CF_IPV4_RANGES`/`CF_IPV6_RANGES`; `ipv4_parse`/`ipv6_parse` without subshells; `ipv6_prefix48` reuses `ipv6_parse`. shellcheck clean, scratch harness 23/0.

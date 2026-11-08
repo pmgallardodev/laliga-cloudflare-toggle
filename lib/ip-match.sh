@@ -6,92 +6,109 @@
 # tests/test-ip-match.sh. Compatible con bash 3 (sin arrays asociativos).
 # =============================================================================
 
-# Comprobar si una IP pertenece a los rangos de Cloudflare
-# Usa los rangos publicados en cloudflare.com/ips
-is_cloudflare_ip() {
-    local ip="$1"
+# Rangos publicados en https://www.cloudflare.com/ips/ (ips-v4 e ips-v6).
+# Lista unica: is_cloudflare_ip y los tests la recorren.
+CF_IPV4_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
+141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22
+198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
+CF_IPV6_RANGES="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32
+2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
 
-    # IPv6: comprobar prefijos conocidos de Cloudflare
+# Validar una IPv4 a.b.c.d y dejar su valor entero en _IP4_INT.
+# Rechaza octetos > 255 y con ceros a la izquierda. Sin subshells: se llama
+# por cada entrada del feed.
+ipv4_parse() {
+    local o1 o2 o3 o4 o
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    o1="${BASH_REMATCH[1]}"
+    o2="${BASH_REMATCH[2]}"
+    o3="${BASH_REMATCH[3]}"
+    o4="${BASH_REMATCH[4]}"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" == 0 || "$o" != 0* ]] || return 1
+        [[ "$o" -le 255 ]] || return 1
+    done
+    _IP4_INT=$(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 ))
+}
+
+# Validar una IPv6 y dejar sus 8 grupos (decimal) en el array _IP6.
+# Admite "::" una vez, mayusculas y zona (%eth0). Sin IPv4 embebida.
+ipv6_parse() {
+    local ip="${1%%%*}" head tail n i g
+    local h=() t=()
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        head="${ip%%::*}"
+        tail="${ip#*::}"
+        [[ "$tail" != *::* ]] || return 1
+    else
+        head="$ip"
+        tail=""
+    fi
+    [[ "$head" != :* && "$head" != *: && "$tail" != :* && "$tail" != *: ]] || return 1
+    if [[ -n "$head" ]]; then IFS=':' read -ra h <<< "$head"; fi
+    if [[ -n "$tail" ]]; then IFS=':' read -ra t <<< "$tail"; fi
+    if [[ "$ip" == *::* ]]; then
+        n=$(( 8 - ${#h[@]} - ${#t[@]} ))
+        [[ "$n" -ge 1 ]] || return 1
+    else
+        [[ ${#h[@]} -eq 8 ]] || return 1
+        n=0
+    fi
+    _IP6=()
+    for g in ${h[@]+"${h[@]}"}; do
+        [[ "$g" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        _IP6+=( $((16#$g)) )
+    done
+    for (( i = 0; i < n; i++ )); do _IP6+=(0); done
+    for g in ${t[@]+"${t[@]}"}; do
+        [[ "$g" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        _IP6+=( $((16#$g)) )
+    done
+}
+
+# Comprobar si una IP (v4 o v6) pertenece a los rangos de Cloudflare con
+# pertenencia numerica exacta al prefijo. Un nombre (CNAME de dig) no lo es.
+is_cloudflare_ip() {
+    local ip="$1" range len shift_bits x i bits same
     if [[ "$ip" == *:* ]]; then
-        local cf6_prefixes="2400:cb00 2606:4700 2803:f800 2405:b500 2405:8100 2a06:98c 2c0f:f248"
-        local lower prefix
-        lower="$(printf '%s' "$ip" | tr 'A-F' 'a-f')"
-        for prefix in $cf6_prefixes; do
-            [[ "$lower" == ${prefix}* ]] && return 0
+        ipv6_parse "$ip" || return 1
+        local ipg=("${_IP6[@]}")
+        for range in $CF_IPV6_RANGES; do
+            len="${range#*/}"
+            ipv6_parse "${range%/*}" || continue
+            same=1
+            for (( i = 0; i < 8; i++ )); do
+                bits=$(( len - 16 * i ))
+                if [[ "$bits" -le 0 ]]; then break; fi
+                if [[ "$bits" -gt 16 ]]; then bits=16; fi
+                shift_bits=$(( 16 - bits ))
+                if [[ $(( ipg[i] >> shift_bits )) -ne $(( _IP6[i] >> shift_bits )) ]]; then
+                    same=0
+                    break
+                fi
+            done
+            if [[ "$same" -eq 1 ]]; then return 0; fi
         done
         return 1
     fi
 
-    # Solo IPv4 con forma a.b.c.d (descarta CNAMEs que devuelve dig +short)
-    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
-
-    local oct1 oct2 oct3
-    IFS='.' read -r oct1 oct2 oct3 _ <<< "$ip"
-
-    # Rangos Cloudflare IPv4 (de cloudflare.com/ips-v4):
-    # 103.21.244.0/22, 103.22.200.0/22, 103.31.4.0/22
-    # 104.16.0.0/13 (104.16-23.x.x), 104.24.0.0/14 (104.24-27.x.x)
-    # 108.162.192.0/18
-    # 131.0.72.0/22
-    # 141.101.64.0/18
-    # 162.158.0.0/15 (162.158-159.x.x)
-    # 172.64.0.0/13 (172.64-71.x.x)
-    # 173.245.48.0/20
-    # 188.114.96.0/20 (188.114.96-111.x.x)
-    # 190.93.240.0/20
-    # 197.234.240.0/22
-    # 198.41.128.0/17 (198.41.128-255.x.x)
-    case "$oct1" in
-        103) [[ "$oct2" -eq 21 || "$oct2" -eq 22 || "$oct2" -eq 31 ]] && return 0 ;;
-        104) [[ "$oct2" -ge 16 && "$oct2" -le 27 ]] && return 0 ;;
-        108) [[ "$oct2" -eq 162 ]] && return 0 ;;
-        131) [[ "$oct2" -eq 0 && "$oct3" -ge 72 && "$oct3" -le 75 ]] && return 0 ;;
-        141) [[ "$oct2" -eq 101 ]] && return 0 ;;
-        162) [[ "$oct2" -ge 158 && "$oct2" -le 159 ]] && return 0 ;;
-        172) [[ "$oct2" -ge 64 && "$oct2" -le 71 ]] && return 0 ;;
-        173) [[ "$oct2" -eq 245 ]] && return 0 ;;
-        188) [[ "$oct2" -eq 114 && "$oct3" -ge 96 && "$oct3" -le 111 ]] && return 0 ;;
-        190) [[ "$oct2" -eq 93 ]] && return 0 ;;
-        197) [[ "$oct2" -eq 234 ]] && return 0 ;;
-        198) [[ "$oct2" -eq 41 && "$oct3" -ge 128 ]] && return 0 ;;
-    esac
+    ipv4_parse "$ip" || return 1
+    x="$_IP4_INT"
+    for range in $CF_IPV4_RANGES; do
+        len="${range#*/}"
+        ipv4_parse "${range%/*}" || continue
+        shift_bits=$(( 32 - len ))
+        if [[ $(( x >> shift_bits )) -eq $(( _IP4_INT >> shift_bits )) ]]; then return 0; fi
+    done
     return 1
 }
 
 # Prefijo /48 normalizado de una IPv6 (los 3 primeros grupos, sin ceros a la
 # izquierda, en minusculas). Expande "::". Ej: 2606:4700:0010::1 -> 2606:4700:10
 ipv6_prefix48() {
-    local ip head tail n i g out
-    ip="$(printf '%s' "$1" | tr 'A-F' 'a-f')"
-    ip="${ip%%%*}"  # quitar zona (%eth0) si la hubiera
-
-    if [[ "$ip" == *::* ]]; then
-        head="${ip%%::*}"
-        tail="${ip#*::}"
-    else
-        head="$ip"
-        tail=""
-    fi
-
-    local h=() t=() groups=()
-    [[ -n "$head" ]] && IFS=':' read -ra h <<< "$head"
-    [[ -n "$tail" ]] && IFS=':' read -ra t <<< "$tail"
-
-    groups=(${h[@]+"${h[@]}"})
-    n=$(( 8 - ${#h[@]} - ${#t[@]} ))
-    for (( i = 0; i < n; i++ )); do groups+=("0"); done
-    groups+=(${t[@]+"${t[@]}"})
-
-    [[ ${#groups[@]} -ge 3 ]] || return 1
-
-    out=""
-    for (( i = 0; i < 3; i++ )); do
-        g="${groups[$i]}"
-        [[ "$g" =~ ^[0-9a-f]{1,4}$ ]] || return 1
-        out="${out}$(printf '%x' "0x$g")"
-        [[ $i -lt 2 ]] && out="${out}:"
-    done
-    printf '%s\n' "$out"
+    ipv6_parse "$1" || return 1
+    printf '%x:%x:%x\n' "${_IP6[0]}" "${_IP6[1]}" "${_IP6[2]}"
 }
 
 # Clave de bloque vecino: /24 para IPv4 (a.b.c), /48 para IPv6

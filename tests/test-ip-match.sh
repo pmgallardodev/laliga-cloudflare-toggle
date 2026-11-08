@@ -59,6 +59,61 @@ check "ipv6_prefix48 completa" "2a06:98c1:3120" "$(ipv6_prefix48 2A06:98C1:3120:
 check "ip_block_key IPv4" "188.114.96" "$(ip_block_key 188.114.96.5)"
 check "is_cloudflare_ip descarta CNAME" "no" "$(is_cloudflare_ip foo.cdn.cloudflare.net. && echo si || echo no)"
 
+# --- is_cloudflare_ip: pertenencia exacta a los rangos publicados (T7) ---
+cf() { is_cloudflare_ip "$1" && echo si || echo no; }
+# Conversion propia del test (independiente de la del lib)
+t_ip2int() { local a b c d; IFS=. read -r a b c d <<< "$1"; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
+t_int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+# Fuera de un rango pero dentro del contiguo: 104.16.0.0/13 y 104.24.0.0/14
+adjacent_cf="104.24.0.0 104.23.255.255"
+n_ranges=0
+for range in $CF_IPV4_RANGES; do
+    n_ranges=$((n_ranges + 1))
+    first="$(t_ip2int "${range%/*}")"
+    last=$(( first + (1 << (32 - ${range#*/})) - 1 ))
+    check "cf4 $range primera" "si" "$(cf "$(t_int2ip "$first")")"
+    check "cf4 $range ultima" "si" "$(cf "$(t_int2ip "$last")")"
+    for out in "$(t_int2ip $((first - 1)))" "$(t_int2ip $((last + 1)))"; do
+        expected=no
+        [[ " $adjacent_cf " == *" $out "* ]] && expected=si
+        check "cf4 $range justo fuera ($out)" "$expected" "$(cf "$out")"
+    done
+done
+check "cf4: 15 rangos publicados" "15" "$n_ranges"
+check "cf4: 108.162.1.2 fuera de 108.162.192.0/18" "no" "$(cf 108.162.1.2)"
+check "cf4: 131.0.76.1 fuera de 131.0.72.0/22" "no" "$(cf 131.0.76.1)"
+check "cf4: octeto > 255" "no" "$(cf 104.16.0.256)"
+check "cf4: ceros a la izquierda" "no" "$(cf 104.016.0.1)"
+check "cf4: tres octetos" "no" "$(cf 104.16.0)"
+
+F6="ffff:ffff:ffff:ffff:ffff:ffff"
+# rango | primera | ultima | justo antes | justo despues
+v6_cases="2400:cb00::/32|2400:cb00::|2400:cb00:$F6|2400:caff:$F6|2400:cb01::
+2606:4700::/32|2606:4700::|2606:4700:$F6|2606:46ff:$F6|2606:4701::
+2803:f800::/32|2803:f800::|2803:f800:$F6|2803:f7ff:$F6|2803:f801::
+2405:b500::/32|2405:b500::|2405:b500:$F6|2405:b4ff:$F6|2405:b501::
+2405:8100::/32|2405:8100::|2405:8100:$F6|2405:80ff:$F6|2405:8101::
+2a06:98c0::/29|2a06:98c0::|2a06:98c7:$F6|2a06:98bf:$F6|2a06:98c8::
+2c0f:f248::/32|2c0f:f248::|2c0f:f248:$F6|2c0f:f247:$F6|2c0f:f249::"
+n_ranges=0
+cf6_flat=" $(tr '\n' ' ' <<< "$CF_IPV6_RANGES") "
+while IFS='|' read -r range first last below above; do
+    n_ranges=$((n_ranges + 1))
+    [[ "$cf6_flat" == *" $range "* ]] || check "cf6 $range esta en CF_IPV6_RANGES" "si" "no"
+    check "cf6 $range primera" "si" "$(cf "$first")"
+    check "cf6 $range ultima" "si" "$(cf "$last")"
+    check "cf6 $range justo antes" "no" "$(cf "$below")"
+    check "cf6 $range justo despues" "no" "$(cf "$above")"
+done <<< "$v6_cases"
+check "cf6: 7 rangos publicados" "7" "$(wc -w <<< "$CF_IPV6_RANGES" | xargs)"
+check "cf6: 2a06:98cf::1 fuera de /29" "no" "$(cf 2a06:98cf::1)"
+check "cf6: mayusculas" "si" "$(cf 2606:4700:3030::AC43:1)"
+check "cf6: dos ::" "no" "$(cf 2606:4700::1::2)"
+check "cf6: grupo no hex" "no" "$(cf 2606:4700:gggg::1)"
+check "cf6: nueve grupos" "no" "$(cf 2606:4700:0:0:0:0:0:0:1)"
+check "cf6: siete grupos sin ::" "no" "$(cf 2606:4700:0:0:0:0:1)"
+check "cf6: dos puntos al final" "no" "$(cf 2606:4700::1:)"
+
 # --- find_blocks sobre un fixture de hayahora ---
 fixture='{"data":[
  {"ip":"188.114.96.5","isp":"DIGI","stateChanges":[{"state":false},{"state":true}]},
