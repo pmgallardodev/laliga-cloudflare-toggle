@@ -138,6 +138,17 @@ check "summarize_matches: ignora lineas vacias" \
     "1 coincidencia: DIGI 188.114.96.5 (same24)" "$(printf '\n%s\n\n' "$(head -1 <<< "$five")" | summarize_matches 3)"
 check "summarize_matches: max 0 solo cuenta" "5 coincidencias: +5 mas" "$(summarize_matches 0 <<< "$five")"
 
+# --- restore_due: histeresis antes de rehabilitar ---
+due() { restore_due "$@" && echo due || echo wait; }
+check "restore_due: sin marca de libre espera" "wait" "$(due "" 1000 900)"
+check "restore_due: sin marca y 0 minutos rehabilita ya" "due" "$(due "" 1000 0)"
+check "restore_due: 0 minutos con marca rehabilita ya" "due" "$(due 1000 1000 0)"
+check "restore_due: un segundo antes del limite espera" "wait" "$(due 1000 1899 900)"
+check "restore_due: justo en el limite rehabilita" "due" "$(due 1000 1900 900)"
+check "restore_due: pasado el limite rehabilita" "due" "$(due 1000 5000 900)"
+check "restore_due: marca no numerica espera" "wait" "$(due "abc" 5000 900)"
+check "restore_due: marca en el futuro espera" "wait" "$(due 6000 5000 900)"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]

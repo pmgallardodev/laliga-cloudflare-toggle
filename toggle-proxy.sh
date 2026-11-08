@@ -230,6 +230,8 @@ ECS_RESOLVER="8.8.8.8"
 ES_ECS_SUBNETS="80.58.0.0/16 62.37.0.0/16 90.160.0.0/16 79.116.0.0/16 37.29.0.0/16"
 
 CF_IPS_FILE="${STATE_FILE%.json}_ips.json"
+# Momento en que cada dominio deshabilitado quedo libre: {"dominio": epoch}
+CLEAR_FILE="${STATE_FILE%.json}_clear.json"
 
 # Filtro jq: registros del state que pertenecen a un dominio de DOMAINS.
 # Las entradas nuevas llevan "domain"; las antiguas se asignan por nombre.
@@ -306,6 +308,35 @@ forget_ips_for() {
         && atomic_write "$CF_IPS_FILE" "$new"
 }
 
+# Leer el archivo de marcas de libre ({} si no existe o esta corrupto)
+read_clear_file() {
+    if [[ -f "$CLEAR_FILE" ]] && [[ -s "$CLEAR_FILE" ]]; then
+        jq -c 'if type == "object" then . else {} end' "$CLEAR_FILE" 2>/dev/null || echo '{}'
+    else
+        echo '{}'
+    fi
+}
+
+# Epoch desde el que un dominio esta libre (vacio si no hay marca)
+clear_since_for() {
+    read_clear_file | jq -r --arg d "$1" '.[$d] // empty'
+}
+
+# Marcar un dominio como libre desde <epoch>
+set_clear_since() {
+    local new
+    new="$(read_clear_file | jq -c --arg d "$1" --argjson t "$2" '.[$d] = $t')" \
+        && atomic_write "$CLEAR_FILE" "$new"
+}
+
+# Borrar la marca de libre de un dominio (nuevo bloqueo o ya rehabilitado)
+forget_clear_for() {
+    local new
+    [[ -f "$CLEAR_FILE" ]] || return 0
+    new="$(read_clear_file | jq -c --arg d "$1" 'del(.[$d])')" \
+        && atomic_write "$CLEAR_FILE" "$new"
+}
+
 # =============================================================================
 # PASO 1: Consultar hayahora.futbol
 # =============================================================================
@@ -339,6 +370,15 @@ fi
 
 MAX_DISABLED_SECONDS="${MAX_DISABLED_HOURS:-12}"
 MAX_DISABLED_SECONDS=$((MAX_DISABLED_SECONDS * 3600))
+
+# Histeresis: minutos que un dominio debe seguir libre antes de rehabilitarlo.
+# Evita el ciclo deshabilitar/rehabilitar cuando hayahora alterna IPs vecinas.
+MIN_CLEAR_MINUTES="${MIN_CLEAR_MINUTES:-15}"
+if [[ ! "$MIN_CLEAR_MINUTES" =~ ^[0-9]+$ ]]; then
+    log "WARN" "MIN_CLEAR_MINUTES='$MIN_CLEAR_MINUTES' no es un numero de minutos. Usando 15."
+    MIN_CLEAR_MINUTES=15
+fi
+MIN_CLEAR_SECONDS=$((MIN_CLEAR_MINUTES * 60))
 
 hayahora_ok=true
 hayahora_data="$(curl -s --max-time 15 "$HAYAHORA_API")" || hayahora_ok=false
@@ -550,6 +590,7 @@ enable_domain() {
     remaining="$(domain_state_count "$zone_id" "$domain")"
     if [[ "$remaining" -eq 0 ]]; then
         forget_ips_for "$domain"
+        forget_clear_for "$domain"
         log "INFO" "  Todos los registros de $domain restaurados."
         total_restored=$((total_restored + record_count))
         restored_lines="${restored_lines}$(echo "$state_records" | jq -r '.[] | "  - \(.type) \(.name)"')"$'\n'
@@ -666,6 +707,11 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
             fi
             continue
         fi
+        # Bloqueado otra vez: el contador de libre vuelve a empezar
+        if [[ -n "$(clear_since_for "$domain")" ]]; then
+            log "INFO" "  Bloqueo de nuevo: se reinicia el contador de libre de $domain."
+            forget_clear_for "$domain"
+        fi
         # Guardar las IPs de Cloudflare actuales (antes de cambiar el proxy)
         # para comprobar en siguientes ejecuciones si el bloqueo sigue
         if [[ "$legacy_check" == "false" ]]; then
@@ -679,6 +725,29 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
             disable_reasons="${disable_reasons}${domain}: ${reason}"$'\n'
         fi
     elif [[ "$state_n" -gt 0 ]]; then
+        # Histeresis (solo con hayahora accesible; si esta caida manda el
+        # timeout de arriba): rehabilitar tras MIN_CLEAR_MINUTES libre seguido
+        if [[ "$hayahora_ok" == "true" ]]; then
+            now="$(date +%s)"
+            clear_since="$(clear_since_for "$domain")"
+            if ! restore_due "$clear_since" "$now" "$MIN_CLEAR_SECONDS"; then
+                if [[ ! "$clear_since" =~ ^[0-9]+$ ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        log "DRY_RUN" "  Libre por primera vez. Se empezaria a contar ${MIN_CLEAR_MINUTES}m antes de rehabilitar $domain."
+                        continue
+                    fi
+                    set_clear_since "$domain" "$now" || {
+                        log "ERROR" "  No se pudo guardar la marca de libre de $domain"
+                        any_error=true
+                    }
+                    clear_since="$now"
+                fi
+                clear_elapsed=$((now - clear_since))
+                clear_wait=$(( (MIN_CLEAR_SECONDS - clear_elapsed + 59) / 60 ))
+                log "INFO" "  Libre desde hace $((clear_elapsed / 60))m, rehabilitando en ${clear_wait}m (MIN_CLEAR_MINUTES=${MIN_CLEAR_MINUTES})."
+                continue
+            fi
+        fi
         if [[ "$DRY_RUN" == "true" ]]; then
             log "DRY_RUN" "  ACCION NECESARIA: bloqueo terminado. Se REHABILITARIA el proxy en $state_n registro(s) de $domain."
             continue
@@ -704,8 +773,8 @@ fi
 # =============================================================================
 
 final_count="$(read_state | jq 'length')"
-if [[ "$final_count" -eq 0 ]] && [[ -f "$STATE_FILE" || -f "$CF_IPS_FILE" ]]; then
-    rm -f "$STATE_FILE" "$CF_IPS_FILE"
+if [[ "$final_count" -eq 0 ]] && [[ -f "$STATE_FILE" || -f "$CF_IPS_FILE" || -f "$CLEAR_FILE" ]]; then
+    rm -f "$STATE_FILE" "$CF_IPS_FILE" "$CLEAR_FILE"
     log "INFO" "Todos los registros restaurados. State file eliminado."
 fi
 

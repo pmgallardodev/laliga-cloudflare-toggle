@@ -205,6 +205,17 @@ summarize_matches() {
     printf '%s\n' "$out"
 }
 
+# Histeresis: decidir si ya toca rehabilitar un dominio que esta libre.
+#   restore_due <libre_desde_epoch_o_vacio> <ahora_epoch> <min_segundos>
+# Devuelve 0 si lleva libre al menos <min_segundos> (o si min es 0).
+# Sin marca valida devuelve 1: el dominio acaba de quedar libre.
+restore_due() {
+    local clear_since="$1" now="$2" min_seconds="$3"
+    [[ "$min_seconds" -le 0 ]] && return 0
+    [[ "$clear_since" =~ ^[0-9]+$ ]] || return 1
+    [[ $((now - clear_since)) -ge "$min_seconds" ]]
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)

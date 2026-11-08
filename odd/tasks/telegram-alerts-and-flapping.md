@@ -33,7 +33,7 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
       limit, and log `ERROR` when the API answers `ok != true`.
 - [x] T3: alert only on newly disabled records, and summarize the reasons (a capped number of
       matches per domain, then "+N more").
-- [ ] T4: add a restore hysteresis. `MIN_CLEAR_MINUTES` (default 15) is how long a domain must
+- [x] T4: add a restore hysteresis. `MIN_CLEAR_MINUTES` (default 15) is how long a domain must
       stay clear in consecutive checks before it is restored. A new block resets the clear timer.
 - [ ] T5: document the new options in `README.md` and `.env.example`.
 
@@ -62,9 +62,16 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
   3500 characters (half per part when there are two). `notify_telegram` logs `ERROR` with
   `.description` when `ok != true`; harness run with `ok:false` logged it and exited 0.
   shellcheck: only the 2 pre-existing warnings; `bash -n` ok.
-- T3 (delegated writer) fix(alerts) commit, hash recorded in the T4 entry. `summarize_matches`
+- T3 (delegated writer) `e798591` fix(alerts): notify only new disables with a summarized reason. `summarize_matches`
   RED: `command not found` (5 of 6 new checks failed); GREEN: 42 ok / 0 fallos. DISABLED alert
   lists only records disabled in this run plus the state total; a reason is added only for
   domains with a new disable. Harness: a second blocked domain alerts only itself, a still-blocked
   run sends no DISABLED alert, 150 matches summarize to "+147 mas". shellcheck: only the 2
   pre-existing warnings; `bash -n` ok.
+- T4 (delegated writer) feat(restore) commit, hash recorded in the T5 entry. `restore_due` RED:
+  4 of 8 new checks failed (`command not found`); GREEN: 50 ok / 0 fallos. Clear marks live in
+  `${STATE_FILE%.json}_clear.json`, written with `atomic_write`, reset on a new block, deleted
+  after a full restore and by the end-of-run cleanup. Harness (23/23): one clear run with
+  `MIN_CLEAR_MINUTES=15` does not restore; a 20-minute-old mark restores; `0` restores at once;
+  DRY_RUN writes no mark; a down feed leaves marks untouched and keeps the timeout path.
+  shellcheck: only the 2 pre-existing warnings; `bash -n` ok.
