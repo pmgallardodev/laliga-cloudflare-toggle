@@ -49,6 +49,25 @@ PROTECTED_DOMAINS_BUILTIN="media.upload-post.com"
 
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 
+# --- Log acotado ----------------------------------------------------------------
+# Rotacion por tamano al empezar cada ejecucion (ya con el lock): si el log pasa de
+# LOG_MAX_BYTES (5 MB por defecto; 0 = sin rotacion) se mueve a .1 y el .1 a
+# .2. Se guardan 2 rotados, asi que el maximo es ~3 x LOG_MAX_BYTES.
+LOG_MAX_BYTES_RAW="${LOG_MAX_BYTES:-5242880}"
+LOG_MAX_BYTES_OK=true
+if ! LOG_MAX_BYTES="$(parse_uint "$LOG_MAX_BYTES_RAW" 0 1000000000000)"; then
+    LOG_MAX_BYTES=5242880
+    LOG_MAX_BYTES_OK=false
+fi
+rotate_log() {
+    local size
+    [[ "$LOG_MAX_BYTES" -gt 0 && -f "$LOG_FILE" ]] || return 0
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null | tr -d ' ')" || return 0
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt "$LOG_MAX_BYTES" ]] || return 0
+    mv -f "${LOG_FILE}.1" "${LOG_FILE}.2" 2>/dev/null || true
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+}
+
 # --- Funciones auxiliares ----------------------------------------------------
 
 # Un fallo al escribir el log (disco lleno, permisos) nunca aborta la
@@ -295,6 +314,10 @@ trap cleanup EXIT
 # el comando en curso (un curl, max 30 s) y sale; el trap EXIT libera el lock.
 # Un PATCH sin confirmar queda "pending" y se reconcilia en la siguiente.
 trap 'log "WARN" "Senal recibida: saliendo."; exit 143' TERM INT
+rotate_log
+if [[ "$LOG_MAX_BYTES_OK" != "true" ]]; then
+    log "WARN" "LOG_MAX_BYTES='$LOG_MAX_BYTES_RAW' no es un numero de bytes. Usando 5242880 (5 MB)."
+fi
 
 # --- Verificar dependencias -------------------------------------------------
 

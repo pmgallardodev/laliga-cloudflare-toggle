@@ -737,6 +737,27 @@ t_atomic_write_unique_tmp() {
     ok "no quedan temporales" '[[ $(ls "${APP}/state" | grep -vc -e "^proxy_disabled" -e "^toggle-proxy" ) == 0 && -z "$(ls "${APP}/state" | grep -E "json\.[A-Za-z0-9]{6}$")" ]]'
 }
 
+# --- T22: rotacion del log por tamano -------------------------------------------------
+
+t_log_rotation() {
+    setup log-rotation
+    mkdir -p "${APP}/logs"
+    head -c 2000 /dev/zero | tr '\0' 'x' > "$LOG"
+    echo viejo1 > "${LOG}.1"
+    echo viejo2 > "${LOG}.2"
+    KEEP_LOG=1 run_app LOG_MAX_BYTES=1000
+    ok "log > LOG_MAX_BYTES se rota a .1" '[[ $(wc -c < "${LOG}.1" | xargs) == 2000 ]]'
+    ok ".1 anterior pasa a .2 y el .2 viejo se descarta" '[[ $(cat "${LOG}.2") == viejo1 && ! -e "${LOG}.3" ]]'
+    ok "el log nuevo empieza de cero" '[[ $(wc -c < "$LOG" | xargs) -lt 2000 ]] && grep -q Hecho "$LOG"'
+    KEEP_LOG=1 run_app LOG_MAX_BYTES=1000000
+    ok "por debajo del limite no rota" '[[ $(wc -c < "${LOG}.1" | xargs) == 2000 ]]'
+    head -c 2000 /dev/zero | tr '\0' 'y' >> "$LOG"
+    KEEP_LOG=1 run_app LOG_MAX_BYTES=0
+    ok "LOG_MAX_BYTES=0 desactiva la rotacion" '[[ $(wc -c < "${LOG}.1" | xargs) == 2000 ]]'
+    KEEP_LOG=1 run_app LOG_MAX_BYTES=08x
+    ok "LOG_MAX_BYTES invalido avisa" 'grep -q "WARN.*LOG_MAX_BYTES" "$LOG"'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
