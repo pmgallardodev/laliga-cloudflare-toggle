@@ -586,6 +586,7 @@ reapplied_names=""
 disable_reasons=""
 restored_lines=""
 total_restored=0
+restore_pending_lines=""
 enable_reasons=""
 
 # Quitar el proxy a los registros proxied de un dominio
@@ -744,6 +745,7 @@ enable_domain() {
 
     local state_records record_count i record_id record_name record_type
     local record_content current current_proxied current_name body remaining
+    record_type=""
 
     state_records="$(read_state | jq -c --arg zid "$zone_id" --arg d "$domain" \
         "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))]')"
@@ -757,8 +759,14 @@ enable_domain() {
 
         # Obtener estado actual del registro en Cloudflare
         if ! cf_api GET "/zones/${zone_id}/dns_records/${record_id}"; then
-            log "ERROR" "  No se pudo obtener registro $record_id ($record_name). Saltando."
-            any_error=true
+            if cf_record_missing; then
+                # Borrado en Cloudflare: no hay nada que restaurar
+                log "WARN" "  $record_name ya no existe en Cloudflare. Se da por resuelto."
+                state_remove "$record_id" || any_error=true
+            else
+                log "ERROR" "  No se pudo obtener registro $record_id ($record_name). Saltando."
+                any_error=true
+            fi
             continue
         fi
         current="$CF_BODY"
@@ -788,11 +796,15 @@ enable_domain() {
             fi
         fi
 
-        # Eliminar este registro del state file INMEDIATAMENTE (crash-safe)
+        # Eliminar este registro del state file INMEDIATAMENTE (crash-safe) y
+        # contarlo ya: aunque otro registro del dominio falle, este se alerta
         state_remove "$record_id" || {
             log "ERROR" "  No se pudo actualizar state file tras rehabilitar $record_name"
             any_error=true
         }
+        total_restored=$((total_restored + 1))
+        restored_lines="${restored_lines}  - ${record_type:-$(echo "$state_records" | jq -r ".[$i].type")} ${record_name}"$'\n'
+        record_type=""
     done
 
     remaining="$(domain_state_count "$zone_id" "$domain")"
@@ -800,10 +812,9 @@ enable_domain() {
         forget_ips_for "$domain"
         forget_clear_for "$domain"
         log "INFO" "  Todos los registros de $domain restaurados."
-        total_restored=$((total_restored + record_count))
-        restored_lines="${restored_lines}$(echo "$state_records" | jq -r '.[] | "  - \(.type) \(.name)"')"$'\n'
     else
         log "WARN" "  $remaining registro(s) de $domain no se pudieron rehabilitar. Se reintentara en la proxima ejecucion."
+        restore_pending_lines="${restore_pending_lines}  - ${domain}: ${remaining} registro(s) siguen en gris"$'\n'
     fi
 }
 
@@ -890,6 +901,12 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
         if [[ "$state_n" -eq 0 ]]; then
             log "INFO" "  hayahora caida y proxy activo. Sin accion (fail-safe)."
             continue
+        fi
+        # Solo cuentan comprobaciones libres seguidas con el feed sano: la
+        # caida reinicia el contador de libre
+        if [[ "$DRY_RUN" != "true" && -n "$(clear_since_for "$domain")" ]]; then
+            log "INFO" "  hayahora caida: se reinicia el contador de libre de $domain."
+            forget_clear_for "$domain" || any_error=true
         fi
         # Timeout desde la entrada mas antigua del dominio. disabled_at puede ser
         # epoch (actual) o ISO 8601 (legacy, siempre UTC). Uno ilegible se da
@@ -1044,10 +1061,13 @@ if [[ "$total_restored" -gt 0 ]]; then
 
 El bloqueo de LaLiga ha terminado. Se ha restaurado el proxy (nube gris → naranja) en $total_restored registro(s):
 
-<code>$(html_escape "$(truncate_text "$restored_lines" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
+<code>$(html_escape "$(truncate_text "$restored_lines" $(( (TELEGRAM_TEXT_BUDGET - 400) / 2 )))")</code>
 ${enable_reasons:+
 Motivo:
-$(html_escape "$(truncate_text "$enable_reasons" $((TELEGRAM_TEXT_BUDGET / 2)))")}
+$(html_escape "$(truncate_text "$enable_reasons" $(( (TELEGRAM_TEXT_BUDGET - 400) / 2 )))")}${restore_pending_lines:+
+
+Restauracion parcial, pendiente de reintentar:
+$(html_escape "$(truncate_text "$restore_pending_lines" 400)")}
 EOF
 )"
 fi

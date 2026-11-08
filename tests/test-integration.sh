@@ -513,6 +513,55 @@ t_pagination_101_records() {
     ok "ninguno queda con proxy" '[[ $(jq "[.[] | select(.proxied)] | length" "${HDATA}/records.json") == 0 ]]'
 }
 
+# --- T15: una caida del feed reinicia el contador de libre ------------------------------
+
+t_outage_resets_clear_timer() {
+    setup outage-resets-clear
+    overdue_state 1999990000
+    feed
+    run_app
+    ok "primera ejecucion libre guarda la marca" '[[ $(jq -r ".[\"example.test\"]" "$CLEAR") == 2000000000 ]]'
+    set_now 2000000300
+    feed_raw 'down'
+    run_app
+    ok "feed caido borra la marca de libre" '[[ $(jq -r ".[\"example.test\"] // \"none\"" "$CLEAR" 2>/dev/null || echo none) == none ]]'
+    set_now 2000003600
+    feed
+    run_app
+    ok "al volver el feed no restaura: el contador empieza de nuevo" '[[ $(patches r1) == 0 && $(jq -r ".[\"example.test\"]" "$CLEAR") == 2000003600 ]]'
+    set_now 2000004500
+    run_app
+    ok "restaura tras MIN_CLEAR_MINUTES seguidos con feed sano" '[[ $(patches r1) == 1 ]]'
+}
+
+# --- T16: contabilidad de restauracion por registro ---------------------------------------
+
+t_partial_restore_alerted() {
+    setup partial-restore
+    records "[$(rec r1 example.test false),$(rec r2 www.example.test false)]"
+    printf '[%s,%s]\n' "$(st r1 example.test)" "$(st r2 www.example.test)" > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+    echo r2 > "${HDATA}/fail_ids"
+    run_app MIN_CLEAR_MINUTES=0
+    ok "r1 restaurado y r2 sigue en el state" '[[ $(proxied_of r1) == true && $(state_ids) == r2 ]]'
+    ok "alerta de la restauracion parcial" 'tg_texts | grep -q REHABILITADO && tg_texts | grep -q "A example.test" && tg_texts | grep -q "1 registro(s)"'
+    ok "la alerta avisa de lo pendiente" 'tg_texts | grep -q "pendiente"'
+    rm -f "${HDATA}/fail_ids"
+    run_app MIN_CLEAR_MINUTES=0
+    ok "el reintento alerta solo de r2" 'tg_texts | grep -q "A www.example.test" && ! tg_texts | grep -q "A example.test$"'
+    ok "y limpia los ficheros" '[[ ! -f $STATE && ! -f $IPS ]]'
+}
+
+t_restore_missing_record_resolved() {
+    setup restore-missing
+    printf '[%s,%s]\n' "$(st r1 example.test)" "$(st r9 gone.example.test)" > "$STATE"
+    records "[$(rec r1 example.test false)]"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+    run_app MIN_CLEAR_MINUTES=0
+    ok "un registro borrado (404) se da por resuelto" 'out_has "gone.example.test ya no existe" && [[ ! -f $STATE ]]'
+    ok "el resto se restaura y se alerta" '[[ $(proxied_of r1) == true ]] && tg_texts | grep -q REHABILITADO'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
