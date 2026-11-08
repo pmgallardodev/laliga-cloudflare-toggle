@@ -184,7 +184,10 @@ cf_api() {
     body="$(echo "$response" | sed '$d')"
 
     if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-        log "ERROR" "Cloudflare API $method $endpoint -> HTTP $http_code"
+        # Incluir los errores de Cloudflare (p.ej. code 1043 en registros read-only)
+        local cf_errors
+        cf_errors="$(echo "$body" | jq -c '.errors // empty' 2>/dev/null || true)"
+        log "ERROR" "Cloudflare API $method $endpoint -> HTTP $http_code${cf_errors:+ $cf_errors}"
         return 1
     fi
 
@@ -383,13 +386,15 @@ disable_domain() {
         return 0
     }
 
-    # Solo registros proxied del dominio y subdominios
+    # Solo registros proxied del dominio y subdominios. Los read-only (p.ej.
+    # creados por un Worker) no se pueden editar: Cloudflare responde 400/1043
     target_records="$(echo "$records_json" | jq -c --arg domain "$domain" '
         [.result[]
          | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
          | select(.name == $domain or (.name | endswith("." + $domain)))
          | select(.proxiable == true)
          | select(.proxied == true)
+         | select((.meta.read_only // false) != true)
          | {id, name, type, content, ttl}
         ]
     ')"
