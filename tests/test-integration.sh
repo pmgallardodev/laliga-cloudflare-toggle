@@ -374,6 +374,68 @@ t_patch_body_only_proxied() {
     ok "un registro renombrado conserva su nombre nuevo" '[[ $(name_of r1) == new.example.test && $(proxied_of r1) == true ]]'
 }
 
+# --- T12: intencion escrita antes del PATCH -------------------------------------------
+
+state_status() { jq -r --arg id "$1" '.[] | select(.record_id == $id) | .status // "legacy"' "$STATE" 2>/dev/null; }
+pending_state() { # pending_state <id> <nombre>
+    printf '[%s]\n' "$(st "$1" "$2" | jq -c '.status = "pending"')" > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+}
+
+t_writeahead_ambiguous_patch() {
+    setup ambiguous-patch
+    feed 104.21.13.229:ISP
+    touch "${HDATA}/patch_ambiguous"
+    run_app
+    ok "PATCH incierto (curl 28) no aborta" '[[ $RC == 0 ]]'
+    ok "el registro quedo gris en Cloudflare" '[[ $(proxied_of r1) == false ]]'
+    ok "la intencion queda en el state como pending" '[[ $(state_status r1) == pending ]]'
+    rm -f "${HDATA}/patch_ambiguous"
+    run_app
+    ok "siguiente ejecucion confirma por GET sin repetir el PATCH" '[[ $(patches r1) == 0 && $(state_status r1) == disabled ]]'
+    ok "y alerta del registro confirmado" 'tg_texts | grep -q "DESHABILITADO" && tg_texts | grep -q "A example.test"'
+    feed
+    run_app MIN_CLEAR_MINUTES=0
+    ok "cuando queda libre lo restaura" '[[ $(proxied_of r1) == true && ! -f $STATE ]]'
+}
+
+t_writeahead_pending_proxied_clear_dropped() {
+    setup pending-proxied-clear
+    pending_state r1 example.test
+    run_app
+    ok "pending con proxy activo y libre: se descarta sin PATCH" '[[ $(patches r1) == 0 && ! -f $STATE ]]'
+}
+
+t_writeahead_pending_proxied_blocked_retried() {
+    setup pending-proxied-blocked
+    pending_state r1 example.test
+    feed 104.21.13.229:ISP
+    run_app
+    ok "pending con proxy activo y bloqueado: se reintenta" '[[ $(patches r1) == 1 && $(state_status r1) == disabled ]]'
+    ok "alerta del reintento" 'tg_texts | grep -q DESHABILITADO'
+}
+
+t_writeahead_pending_missing_record() {
+    setup pending-missing
+    pending_state r9 gone.example.test
+    feed 104.21.13.229:ISP
+    run_app
+    ok "pending de un registro borrado (404) se descarta" '[[ $(state_ids) == r1 ]] && out_has "ya no existe"'
+}
+
+t_writeahead_log_failure_keeps_state() {
+    setup log-failure
+    mkdir -p "${APP}/logs"
+    : > "$LOG"
+    chmod 444 "$LOG"
+    feed 104.21.13.229:ISP
+    run_app
+    chmod 644 "$LOG"
+    ok "un log que no se puede escribir no aborta" '[[ $RC == 0 ]]'
+    ok "el state se guarda igualmente" '[[ $(state_status r1) == disabled && $(proxied_of r1) == false ]]'
+    ok "y la alerta sale" 'tg_texts | grep -q DESHABILITADO'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

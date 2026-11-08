@@ -52,12 +52,15 @@ mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 
 # --- Funciones auxiliares ----------------------------------------------------
 
+# Un fallo al escribir el log (disco lleno, permisos) nunca aborta la
+# ejecucion: el state y las notificaciones importan mas que el log
 log() {
-    local level="$1"
+    local level="$1" timestamp line
     shift
-    local timestamp
-    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[$timestamp] [$level] $*" | tee -a "$LOG_FILE"
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || timestamp="?"
+    line="[$timestamp] [$level] $*"
+    { printf '%s\n' "$line"; } 2>/dev/null || true
+    { printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null || true
 }
 
 notify_telegram() {
@@ -127,6 +130,33 @@ read_state() {
     fi
 }
 
+# --- State con intencion escrita antes del PATCH ------------------------------
+# Cada entrada lleva status: "pending" (se va a quitar el proxy; aun sin
+# confirmar) o "disabled" (confirmado). Las entradas antiguas sin status
+# cuentan como "disabled".
+
+# state_update <filtro_jq> [args jq...]: aplica el filtro al state y lo guarda
+state_update() {
+    local filter="$1" new
+    shift
+    new="$(read_state | jq -c "$@" "$filter")" && atomic_write "$STATE_FILE" "$new"
+}
+
+state_add_pending() { # <zone_id> <dominio> <id> <nombre> <tipo> <contenido> <epoch>
+    state_update 'map(select(.record_id != $id)) + [{zone_id: $zid, domain: $domain, record_id: $id,
+        name: $name, type: $type, content: $content, disabled_at: $ts, status: "pending"}]' \
+        --arg zid "$1" --arg domain "$2" --arg id "$3" --arg name "$4" --arg type "$5" \
+        --arg content "$6" --argjson ts "$7"
+}
+
+state_confirm() { # <id>
+    state_update 'map(if .record_id == $id then .status = "disabled" else . end)' --arg id "$1"
+}
+
+state_remove() { # <id>
+    state_update 'map(select(.record_id != $id))' --arg id "$1"
+}
+
 cleanup() {
     rm -f "$LOCK_FILE"
 }
@@ -174,10 +204,16 @@ fi
 
 # --- Helper API Cloudflare --------------------------------------------------
 
+# Llamada a la API de Cloudflare. No escribe en stdout: deja el cuerpo en
+# CF_BODY y el codigo HTTP en CF_HTTP ("000" si no hubo respuesta completa,
+# p.ej. timeout: el cambio pudo aplicarse o no). Devuelve 0 solo con 2xx y
+# success=true.
 cf_api() {
     local method="$1"
     local endpoint="$2"
     local data="${3:-}"
+    CF_BODY=""
+    CF_HTTP="000"
 
     local args=(
         -s -w "\n%{http_code}"
@@ -192,29 +228,41 @@ cf_api() {
     fi
 
     local response
-    response="$(curl --max-time 30 "${args[@]}")"
+    if ! response="$(curl --max-time 30 "${args[@]}" 2>/dev/null)"; then
+        log "ERROR" "Cloudflare API $method $endpoint -> sin respuesta (error de red o timeout)"
+        return 1
+    fi
 
-    local http_code
-    http_code="$(echo "$response" | tail -1)"
-    local body
-    body="$(echo "$response" | sed '$d')"
+    CF_HTTP="$(printf '%s\n' "$response" | tail -1)"
+    CF_BODY="$(printf '%s\n' "$response" | sed '$d')"
+    [[ "$CF_HTTP" =~ ^[0-9]{3}$ ]] || CF_HTTP="000"
 
-    if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    if [[ $((10#$CF_HTTP)) -lt 200 || $((10#$CF_HTTP)) -ge 300 ]]; then
         # Incluir los errores de Cloudflare (p.ej. code 1043 en registros read-only)
         local cf_errors
-        cf_errors="$(echo "$body" | jq -c '.errors // empty' 2>/dev/null || true)"
-        log "ERROR" "Cloudflare API $method $endpoint -> HTTP $http_code${cf_errors:+ $cf_errors}"
+        cf_errors="$(printf '%s' "$CF_BODY" | jq -c '.errors // empty' 2>/dev/null || true)"
+        log "ERROR" "Cloudflare API $method $endpoint -> HTTP $CF_HTTP${cf_errors:+ $cf_errors}"
         return 1
     fi
 
     local success
-    success="$(echo "$body" | jq -r '.success' 2>/dev/null || echo "false")"
+    success="$(printf '%s' "$CF_BODY" | jq -r '.success' 2>/dev/null || echo "false")"
     if [[ "$success" != "true" ]]; then
-        log "ERROR" "Cloudflare API error: $(echo "$body" | jq -c '.errors' 2>/dev/null)"
+        log "ERROR" "Cloudflare API error: $(printf '%s' "$CF_BODY" | jq -c '.errors' 2>/dev/null || true)"
         return 1
     fi
+}
 
-    echo "$body"
+# Tras un cf_api fallido: 0 si Cloudflare rechazo la peticion (HTTP 4xx), asi
+# que no cambio nada. Sin respuesta o con 5xx el resultado es incierto.
+cf_rejected() {
+    [[ "$CF_HTTP" =~ ^4[0-9][0-9]$ ]]
+}
+
+# Tras un GET fallido: 0 si el registro ya no existe (404 o code 81044)
+cf_record_missing() {
+    [[ "$CF_HTTP" == 404 ]] \
+        || printf '%s' "$CF_BODY" | jq -e 'any(.errors[]?; .code == 81044)' >/dev/null 2>&1
 }
 
 
@@ -453,13 +501,14 @@ disable_domain() {
     fi
 
     local records_json target_records record_count i record record_id record_name
-    local record_type record_content body new_state
+    local record_type record_content body
 
-    records_json="$(cf_api GET "/zones/${zone_id}/dns_records?per_page=100")" || {
+    if ! cf_api GET "/zones/${zone_id}/dns_records?per_page=100"; then
         log "ERROR" "No se pudieron obtener registros DNS para $domain. Saltando."
         any_error=true
         return 0
-    }
+    fi
+    records_json="$CF_BODY"
 
     # Solo registros proxied del dominio y subdominios. Los read-only (p.ej.
     # creados por un Worker) no se pueden editar: Cloudflare responde 400/1043
@@ -503,8 +552,8 @@ disable_domain() {
         # Si ya esta en state file pero vuelve a estar proxied, alguien (o algo)
         # ha reactivado la nube naranja durante el bloqueo: hay que volver a
         # quitarla. Antes se saltaba y la web se quedaba caida todo el partido.
-        if jq -e --arg id "$record_id" '.[] | select(.record_id == $id)' "$STATE_FILE" >/dev/null 2>&1; then
-            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
+        if read_state | jq -e --arg id "$record_id" '.[] | select(.record_id == $id)' >/dev/null 2>&1; then
+            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body"; then
                 log "WARN" "  [REAPLICADO] $record_name estaba en state file pero alguien reactivo el proxy. Quitado de nuevo."
                 total_reapplied=$((total_reapplied + 1))
                 reapplied_names="${reapplied_names}  - ${record_name}"$'\n'
@@ -515,30 +564,77 @@ disable_domain() {
             continue
         fi
 
-        if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
+        # Intencion antes del PATCH: si el PATCH se aplica pero la respuesta se
+        # pierde (timeout) o el proceso muere, la siguiente ejecucion sabe que
+        # este registro puede estar en gris por nuestra causa
+        if ! state_add_pending "$zone_id" "$domain" "$record_id" "$record_name" "$record_type" \
+            "$record_content" "$(date +%s)"; then
+            log "ERROR" "  No se pudo escribir el state: no se toca $record_type $record_name"
+            any_error=true
+            continue
+        fi
+
+        if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body"; then
+            state_confirm "$record_id" || {
+                log "ERROR" "  No se pudo confirmar $record_name en el state (queda pending; se comprobara)"
+                any_error=true
+            }
             log "INFO" "  [OK] Proxy deshabilitado: $record_type $record_name -> $record_content"
             total_disabled=$((total_disabled + 1))
             new_disabled_lines="${new_disabled_lines}  - ${record_type} ${record_name} → ${record_content}"$'\n'
-
-            # Guardar en state file INMEDIATAMENTE tras cada PATCH exitoso
-            new_state="$(jq \
-                --arg zid "$zone_id" \
-                --arg domain "$domain" \
-                --arg id "$record_id" \
-                --arg name "$record_name" \
-                --arg type "$record_type" \
-                --arg content "$record_content" \
-                --argjson ts "$(date +%s)" \
-                '. + [{zone_id: $zid, domain: $domain, record_id: $id, name: $name, type: $type, content: $content, disabled_at: $ts}]' \
-                "$STATE_FILE" 2>/dev/null)" && atomic_write "$STATE_FILE" "$new_state" || {
-                log "ERROR" "  No se pudo actualizar state file para $record_name"
-                any_error=true
-            }
-        else
+        elif cf_rejected; then
+            # Cloudflare lo rechazo: el registro no cambio, se retira la intencion
+            state_remove "$record_id" || any_error=true
             log "ERROR" "  [FAIL] No se pudo deshabilitar proxy para $record_type $record_name"
+            any_error=true
+        else
+            log "ERROR" "  [INCIERTO] Sin respuesta al quitar el proxy de $record_type $record_name. Queda pending y se comprobara en la proxima ejecucion."
             any_error=true
         fi
     done
+}
+
+# Reconciliar las intenciones "pending" de un dominio con el estado real en
+# Cloudflare (PATCH sin respuesta, crash o fallo de log en la ejecucion
+# anterior):
+#   en gris        -> el PATCH se aplico: se confirma (y se alerta)
+#   con proxy      -> no se aplico: se descarta (si sigue bloqueado, el
+#                     dominio se deshabilita de nuevo mas abajo)
+#   ya no existe   -> se descarta
+#   GET fallido    -> se deja pending para la siguiente ejecucion
+reconcile_pending() {
+    local zone_id="$1" domain="$2" id name type content proxied
+    while IFS=$'\t' read -r id name type content; do
+        [[ -n "$id" ]] || continue
+        if ! cf_api GET "/zones/${zone_id}/dns_records/${id}"; then
+            if cf_record_missing; then
+                log "WARN" "  [PENDIENTE] $name ya no existe en Cloudflare. Se descarta."
+                state_remove "$id" || any_error=true
+            else
+                log "ERROR" "  [PENDIENTE] No se pudo comprobar $name. Se reintentara."
+                any_error=true
+            fi
+            continue
+        fi
+        proxied="$(printf '%s' "$CF_BODY" | jq -r '.result.proxied' 2>/dev/null || echo "unknown")"
+        if [[ "$proxied" == "false" ]]; then
+            if state_confirm "$id"; then
+                log "INFO" "  [CONFIRMADO] $type $name quedo sin proxy en una ejecucion anterior."
+                total_disabled=$((total_disabled + 1))
+                new_disabled_lines="${new_disabled_lines}  - ${type} ${name} → ${content}"$'\n'
+            else
+                any_error=true
+            fi
+        elif [[ "$proxied" == "true" ]]; then
+            log "INFO" "  [PENDIENTE] $name sigue con proxy: el cambio no llego a aplicarse. Se descarta."
+            state_remove "$id" || any_error=true
+        else
+            log "ERROR" "  [PENDIENTE] Respuesta inesperada al comprobar $name. Se reintentara."
+            any_error=true
+        fi
+    done < <(read_state | jq -r --arg zid "$zone_id" --arg d "$domain" "$STATE_MINE_JQ"'
+        .[] | select(mine($zid; $d)) | select(.status == "pending")
+        | [.record_id, .name, .type, .content] | @tsv')
 }
 
 # Restaurar el proxy en los registros que este script quito a un dominio
@@ -548,7 +644,7 @@ enable_domain() {
     log "INFO" "=== REHABILITANDO proxy de Cloudflare: $domain (zona: ${zone_id:0:8}...) ==="
 
     local state_records record_count i record_id record_name record_type
-    local record_content current current_proxied current_name body new_state remaining
+    local record_content current current_proxied current_name body remaining
 
     state_records="$(read_state | jq -c --arg zid "$zone_id" --arg d "$domain" \
         "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))]')"
@@ -561,11 +657,12 @@ enable_domain() {
         record_name="$(echo "$state_records" | jq -r ".[$i].name")"
 
         # Obtener estado actual del registro en Cloudflare
-        current="$(cf_api GET "/zones/${zone_id}/dns_records/${record_id}")" || {
+        if ! cf_api GET "/zones/${zone_id}/dns_records/${record_id}"; then
             log "ERROR" "  No se pudo obtener registro $record_id ($record_name). Saltando."
             any_error=true
             continue
-        }
+        fi
+        current="$CF_BODY"
 
         current_proxied="$(echo "$current" | jq '.result.proxied')"
 
@@ -583,7 +680,7 @@ enable_domain() {
             fi
             body='{"proxied":true}'
 
-            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
+            if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body"; then
                 log "INFO" "  [OK] Proxy rehabilitado: $record_type $record_name"
             else
                 log "ERROR" "  [FAIL] No se pudo rehabilitar proxy para $record_name"
@@ -593,8 +690,7 @@ enable_domain() {
         fi
 
         # Eliminar este registro del state file INMEDIATAMENTE (crash-safe)
-        new_state="$(jq --arg id "$record_id" 'map(select(.record_id != $id))' "$STATE_FILE" 2>/dev/null)" \
-            && atomic_write "$STATE_FILE" "$new_state" || {
+        state_remove "$record_id" || {
             log "ERROR" "  No se pudo actualizar state file tras rehabilitar $record_name"
             any_error=true
         }
@@ -618,8 +714,21 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
     zone_id="${ZONE_IDS[$idx]}"
     domain="${DOMAIN_NAMES[$idx]}"
     state_n="$(domain_state_count "$zone_id" "$domain")"
+    domain_reason_added=false
 
     log "INFO" "--- $domain ---"
+
+    # 0. Intenciones sin confirmar de una ejecucion anterior
+    if [[ "$state_n" -gt 0 && "$DRY_RUN" != "true" ]] \
+        && [[ "$(read_state | jq --arg zid "$zone_id" --arg d "$domain" "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d)) | select(.status == "pending")] | length')" -gt 0 ]]; then
+        confirmed_before="$total_disabled"
+        reconcile_pending "$zone_id" "$domain"
+        if [[ "$total_disabled" -gt "$confirmed_before" ]]; then
+            disable_reasons="${disable_reasons}${domain}: confirmado tras una respuesta incierta de Cloudflare"$'\n'
+            domain_reason_added=true
+        fi
+        state_n="$(domain_state_count "$zone_id" "$domain")"
+    fi
 
     # 1. IPs candidatas. Si ya quitamos el proxy, dig devuelve las IPs de origen:
     #    usar las IPs de Cloudflare guardadas al deshabilitarlo.
@@ -736,7 +845,7 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
         disable_domain "$zone_id" "$domain"
         # Motivo solo si esta ejecucion ha deshabilitado algo de este dominio:
         # un bloqueo que sigue activo no vuelve a alertar
-        if [[ "$total_disabled" -gt "$disabled_before" ]]; then
+        if [[ "$total_disabled" -gt "$disabled_before" && "$domain_reason_added" == "false" ]]; then
             disable_reasons="${disable_reasons}${domain}: ${reason}"$'\n'
         fi
     elif [[ "$state_n" -gt 0 ]]; then
