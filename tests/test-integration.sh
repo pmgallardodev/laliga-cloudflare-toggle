@@ -436,6 +436,68 @@ t_writeahead_log_failure_keeps_state() {
     ok "y la alerta sale" 'tg_texts | grep -q DESHABILITADO'
 }
 
+# --- T13: ficheros corruptos --------------------------------------------------------
+
+t_corrupt_state_quarantined() {
+    setup corrupt-state
+    records "[$(rec r1 example.test false)]"
+    dns example.test A 203.0.113.20
+    printf '{garbage' > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+    echo '{"example.test":1999990000}' > "$CLEAR"
+    run_app
+    ok "exit 0" '[[ $RC == 0 ]]'
+    ok "state movido a .corrupt-<epoch> con su contenido" '[[ $(cat "${STATE}.corrupt-2000000000" 2>/dev/null) == "{garbage" && ! -f $STATE ]]'
+    ok "ERROR en el log" 'out_has "ERROR.*corrupto"'
+    ok "no borra IPs ni marcas de libre" '[[ -f $IPS && -f $CLEAR ]]'
+    ok "alerta con el fichero y los dominios a revisar" 'tg_texts | grep -q "corrupt" && tg_texts | grep -q "example.test"'
+    run_app
+    ok "siguientes ejecuciones tampoco borran los ficheros de apoyo" '[[ -f $IPS && -f $CLEAR ]] && out_has "cuarentena"'
+    ok "y no repiten la alerta" '[[ $(tg_count) == 0 ]]'
+}
+
+t_corrupt_state_feed_down_still_alerts() {
+    setup corrupt-state-feed-down
+    printf '{garbage' > "$STATE"
+    feed_raw 'down'
+    run_app
+    ok "con el feed caido tambien alerta del state corrupto" '[[ $RC == 0 ]] && tg_texts | grep -q corrupt'
+}
+
+t_corrupt_state_wrong_type() {
+    setup corrupt-state-type
+    echo '{"record_id":"r1"}' > "$STATE"
+    run_app
+    ok "state con tipo incorrecto tambien va a cuarentena" '[[ -f "${STATE}.corrupt-2000000000" ]]'
+}
+
+t_corrupt_clear_keeps_restoring() {
+    setup corrupt-clear
+    overdue_state 1999990000
+    printf 'not json' > "$CLEAR"
+    feed
+    run_app MIN_CLEAR_MINUTES=0
+    ok "clear corrupto en cuarentena" '[[ -f "${CLEAR}.corrupt-2000000000" ]]'
+    ok "el state parseable se sigue restaurando" '[[ $(patches r1) == 1 && $(proxied_of r1) == true ]]'
+}
+
+t_corrupt_ips_keeps_restoring() {
+    setup corrupt-ips
+    overdue_state 1999990000
+    echo '{"example.test":"not-an-array"}' > "$IPS"
+    feed
+    run_app MIN_CLEAR_MINUTES=0
+    ok "IPs con forma invalida en cuarentena, sin abortar" '[[ $RC == 0 && -f "${IPS}.corrupt-2000000000" ]]'
+    ok "restaura con el check amplio" '[[ $(patches r1) == 1 ]]'
+}
+
+t_corrupt_state_dry_run_untouched() {
+    setup corrupt-dry-run
+    printf '{garbage' > "$STATE"
+    run_app DRY_RUN=true
+    ok "DRY_RUN no mueve el state corrupto" '[[ $(cat "$STATE") == "{garbage" ]] && out_has "ERROR.*corrupto"'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

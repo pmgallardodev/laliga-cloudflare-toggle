@@ -393,6 +393,74 @@ forget_clear_for() {
 }
 
 # =============================================================================
+# Ficheros corruptos: cuarentena, nunca "vacio"
+# =============================================================================
+# Un fichero ilegible o con otra forma se mueve a <fichero>.corrupt-<epoch>,
+# se registra como ERROR y se alerta. No se sustituye en silencio por un
+# valor vacio que luego borre los demas ficheros. En DRY_RUN no se mueve.
+CORRUPT_LINES=""
+
+quarantine_if_invalid() { # <fichero> <condicion_jq_sobre_el_documento>
+    local file="$1" cond="$2" dest
+    [[ -s "$file" ]] || return 0
+    if jq -se "length == 1 and (.[0] | ${cond})" "$file" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "ERROR" "$file esta corrupto (DRY_RUN: no se mueve)"
+        return 0
+    fi
+    dest="${file}.corrupt-$(date +%s)"
+    if mv "$file" "$dest" 2>/dev/null; then
+        log "ERROR" "$file esta corrupto. Movido a $dest para revisarlo."
+        CORRUPT_LINES="${CORRUPT_LINES}  - $(basename "$file") → $(basename "$dest")"$'\n'
+    else
+        log "ERROR" "$file esta corrupto y no se pudo mover a $dest."
+        CORRUPT_LINES="${CORRUPT_LINES}  - $(basename "$file") (no se pudo mover)"$'\n'
+    fi
+}
+
+# Alerta de ficheros en cuarentena (una vez, en la ejecucion que los movio)
+notify_corrupt_files() {
+    [[ -n "$CORRUPT_LINES" ]] || return 0
+    local corrupt_hint="" suspect_domains
+    if [[ "$STATE_WAS_CORRUPT" == "true" ]]; then
+        suspect_domains="$(read_ips_file | jq -r 'if type == "object" then keys | join(", ") else "" end' 2>/dev/null || true)"
+        corrupt_hint="El script ya no sabe que registros quito y no los restaurara solo. Revisa en Cloudflare los registros en gris${suspect_domains:+ de $(html_escape "$suspect_domains")} y borra el fichero .corrupt cuando termines."
+    fi
+    notify_telegram "$(cat <<EOF
+⚠️ <b>Fichero de estado corrupto</b>
+
+Se ha movido a cuarentena:
+<code>$(html_escape "$(truncate_text "$CORRUPT_LINES" "$TELEGRAM_TEXT_BUDGET")")</code>
+${corrupt_hint}
+EOF
+)"
+    CORRUPT_LINES=""
+}
+
+# 0 si hay un state en cuarentena pendiente de revisar
+state_quarantine_exists() {
+    local f
+    for f in "${STATE_FILE}".corrupt-*; do
+        [[ -e "$f" ]] && return 0
+    done
+    return 1
+}
+
+quarantine_if_invalid "$STATE_FILE" \
+    'type == "array" and all(.[]; type == "object" and (.record_id | type) == "string")'
+STATE_WAS_CORRUPT=false
+[[ -n "$CORRUPT_LINES" ]] && STATE_WAS_CORRUPT=true
+quarantine_if_invalid "$CF_IPS_FILE" \
+    '(type == "array" and all(.[]; type == "string"))
+     or (type == "object" and all(.[]; type == "array" and all(.[]; type == "string")))'
+quarantine_if_invalid "$CLEAR_FILE" 'type == "object"'
+if state_quarantine_exists; then
+    log "WARN" "Hay un state en cuarentena (${STATE_FILE}.corrupt-*). Revisa en Cloudflare los registros en gris y borralo despues; mientras exista no se borran los ficheros de apoyo."
+fi
+
+# =============================================================================
 # PASO 1: Consultar hayahora.futbol
 # =============================================================================
 
@@ -470,6 +538,7 @@ else
     log "WARN" "No se pudo obtener datos de $HAYAHORA_API"
     if [[ "$(read_state | jq 'length')" -eq 0 ]]; then
         log "INFO" "Sin state file activo. Abortando sin cambios (fail-safe)."
+        notify_corrupt_files
         exit 0
     fi
 fi
@@ -899,9 +968,17 @@ fi
 
 final_count="$(read_state | jq 'length')"
 if [[ "$final_count" -eq 0 ]] && [[ -f "$STATE_FILE" || -f "$CF_IPS_FILE" || -f "$CLEAR_FILE" ]]; then
-    rm -f "$STATE_FILE" "$CF_IPS_FILE" "$CLEAR_FILE"
-    log "INFO" "Todos los registros restaurados. State file eliminado."
+    if state_quarantine_exists; then
+        # Con el state en cuarentena las IPs guardadas indican que dominios
+        # pueden tener registros en gris: no se borran
+        rm -f "$STATE_FILE"
+    else
+        rm -f "$STATE_FILE" "$CF_IPS_FILE" "$CLEAR_FILE"
+        log "INFO" "Todos los registros restaurados. State file eliminado."
+    fi
 fi
+
+notify_corrupt_files
 
 if [[ "$total_disabled" -gt 0 ]]; then
     log "INFO" "Total en state file: $final_count registro(s) ($total_disabled nuevos en esta ejecucion)"
