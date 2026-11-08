@@ -41,7 +41,7 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
 
 The user authorized fixing all findings, then commit and push of this branch (2026-11-08).
 
-- [ ] T6: validate the feed. Require an HTTP 2xx, a non-empty body, `.data` as an array, string `ip`/`isp`,
+- [x] T6: validate the feed. Require an HTTP 2xx, a non-empty body, `.data` as an array, string `ip`/`isp`,
       a nullable `description`, and `stateChanges` as an array of objects. Any invalid response follows the
       unavailable-feed timeout path, and no jq call can crash the run.
 - [ ] T7: CIDR correctness. Do exact numeric membership for every published Cloudflare IPv4/IPv6 range,
@@ -122,3 +122,4 @@ change). Each entry lists the commit and the observed checks.
   `tests/integration/bin`, and `tests/run-all.sh` (bash 5 and `/bin/bash` 3.2). Covers T1-T4 with the
   current code: 20 ok / 0 fallos on both shells (GREEN by design; it pins existing behaviour). Also
   silences the 2 pre-existing shellcheck warnings with directives (SC1090 `.env`, SC2034).
+- T6 `<T6>` fix(feed): validate hayahora responses. `feed_is_valid` (jq -se, one object, typed fields) RED: `command not found` (13 unit checks failed / 4 passed by accident), integration 18 of 23 failed (exit 5 on `{"error":..}`, data null/string, object stateChanges, null description; empty body treated as healthy). GREEN: unit 67/0, integration 43/0 on bash 5 and 3.2. Feed fetched with `curl -sf` so HTTP >= 400 is unavailable; null description tolerated in the broad check. shellcheck clean, `bash -n` ok, scratch harness 23/0.

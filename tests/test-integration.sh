@@ -184,6 +184,66 @@ t_hysteresis_zero_restores_now() {
     ok "MIN_CLEAR_MINUTES=0 restaura en la primera ejecucion libre" '[[ $(patches r1) == 1 && $(proxied_of r1) == true ]]'
 }
 
+# --- T6: validacion del feed ---------------------------------------------------
+
+# Registro gris en state desde hace mas de 12h (timeout vencido) o reciente
+overdue_state() {
+    records "[$(rec r1 example.test false)]"
+    printf '[%s]\n' "$(st r1 example.test "${1:-1999900000}")" > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+}
+
+t_feed_invalid_shapes_use_timeout() {
+    local name payload
+    for name in error-object data-null data-string changes-object empty-body not-json; do
+        case "$name" in
+            error-object) payload='{"error":"maintenance"}' ;;
+            data-null) payload='{"data":null}' ;;
+            data-string) payload='{"data":"unavailable"}' ;;
+            changes-object) payload='{"data":[{"ip":"104.21.13.229","isp":"X","description":"Cloudflare","stateChanges":{"state":true}}]}' ;;
+            empty-body) payload='' ;;
+            not-json) payload='<html>502</html>' ;;
+        esac
+        setup "feed-$name"
+        overdue_state
+        feed_raw "$payload"
+        run_app
+        ok "feed invalido no aborta (exit 0)" '[[ $RC == 0 ]]'
+        ok "feed invalido se trata como caido" 'out_has "No se pudo obtener datos"'
+        ok "timeout vencido restaura" '[[ $(patches r1) == 1 && $(proxied_of r1) == true ]]'
+    done
+}
+
+t_feed_empty_body_does_not_restore_early() {
+    setup feed-empty-recent
+    overdue_state 1999990000
+    echo '{"example.test":1999998000}' > "$CLEAR"
+    feed_raw ''
+    run_app
+    ok "cuerpo vacio no cuenta como libre" '[[ $(patches r1) == 0 && $(state_ids) == r1 ]]'
+}
+
+t_feed_http_error_is_unavailable() {
+    setup feed-http-500
+    overdue_state 1999990000
+    feed
+    echo 500 > "${HDATA}/feed_code"
+    run_app
+    ok "HTTP 500 cuenta como feed caido" 'out_has "No se pudo obtener datos" && [[ $(patches r1) == 0 ]]'
+}
+
+t_feed_null_description() {
+    setup feed-null-description
+    overdue_state
+    feed_raw '{"data":[{"ip":"104.21.13.229","isp":"ISP","description":null,"stateChanges":[{"state":true}]}]}'
+    run_app
+    ok "description null no aborta" '[[ $RC == 0 ]] && out_has "1 entrada(s) con bloqueo activo"'
+    ok "sigue bloqueado: no restaura" '[[ $(patches r1) == 0 ]]'
+    rm -f "$IPS"
+    run_app
+    ok "check amplio (sin IPs guardadas) con description null" '[[ $RC == 0 ]] && out_has "No hay bloqueos de Cloudflare activos"'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

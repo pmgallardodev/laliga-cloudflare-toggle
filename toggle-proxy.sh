@@ -382,24 +382,31 @@ fi
 MIN_CLEAR_SECONDS=$((MIN_CLEAR_MINUTES * 60))
 
 hayahora_ok=true
-hayahora_data="$(curl -s --max-time 15 "$HAYAHORA_API")" || hayahora_ok=false
+# -f: un HTTP >= 400 hace fallar a curl. Despues se valida la forma: un 2xx
+# vacio o con {"error":..} tambien cuenta como feed no disponible
+hayahora_data="$(curl -sf --max-time 15 "$HAYAHORA_API" 2>/dev/null)" || hayahora_ok=false
 
-if [[ "$hayahora_ok" == "true" ]] && ! echo "$hayahora_data" | jq empty 2>/dev/null; then
+if [[ "$hayahora_ok" == "true" ]] && ! printf '%s' "$hayahora_data" | feed_is_valid; then
+    log "WARN" "Respuesta de hayahora.futbol vacia o con formato inesperado: ${hayahora_data:0:200}"
     hayahora_ok=false
 fi
 
 if [[ "$hayahora_ok" == "true" ]]; then
-    # Entradas con bloqueo activo ("ip<TAB>isp"), calculadas una sola vez
-    hayahora_active="$(echo "$hayahora_data" | jq -r "$HAYAHORA_ACTIVE_JQ")"
+    # Entradas con bloqueo activo ("ip<TAB>isp"), calculadas una sola vez.
+    # La forma ya esta validada; aun asi un fallo de jq no aborta la ejecucion
+    hayahora_active="$(printf '%s' "$hayahora_data" | jq -r "$HAYAHORA_ACTIVE_JQ")" || hayahora_ok=false
     # Para state files antiguos sin IPs guardadas: cualquier bloqueo de Cloudflare
-    cf_blocked_count="$(echo "$hayahora_data" | jq '
+    cf_blocked_count="$(printf '%s' "$hayahora_data" | jq '
         [.data[]
-         | select(.description | test("^Cloudflare"))
+         | select((.description // "") | test("^Cloudflare"))
          | select(.stateChanges | length > 0)
          | select(.stateChanges[-1].state == true)
         ] | length
-    ')"
-    log "INFO" "hayahora.futbol: $(echo "$hayahora_data" | jq "[${HAYAHORA_ACTIVE_JQ}] | length") entrada(s) con bloqueo activo"
+    ')" || hayahora_ok=false
+fi
+
+if [[ "$hayahora_ok" == "true" ]]; then
+    log "INFO" "hayahora.futbol: $(printf '%s' "$hayahora_active" | grep -c . || true) entrada(s) con bloqueo activo"
 else
     log "WARN" "No se pudo obtener datos de $HAYAHORA_API"
     if [[ "$(read_state | jq 'length')" -eq 0 ]]; then

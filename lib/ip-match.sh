@@ -223,6 +223,25 @@ HAYAHORA_ACTIVE_JQ='.data[]
     | select(.stateChanges[-1].state == true)
     | "\(.ip)\t\(.isp)"'
 
+# Validar la forma del feed de hayahora (lee stdin). Devuelve 0 solo si es
+# exactamente un objeto JSON con .data array de objetos con ip/isp string,
+# description string o null y stateChanges array de objetos. Cualquier otra
+# cosa (cuerpo vacio, {"error":..}, data null...) es "feed no disponible".
+feed_is_valid() {
+    jq -se '
+        length == 1
+        and (.[0] | type == "object"
+            and (.data | type) == "array"
+            and all(.data[];
+                type == "object"
+                and (.ip | type) == "string"
+                and (.isp | type) == "string"
+                and ((.description | type) as $t | $t == "string" or $t == "null")
+                and (.stateChanges | type) == "array"
+                and all(.stateChanges[]; type == "object")))
+    ' >/dev/null 2>&1
+}
+
 # Buscar bloqueos activos que afectan a un conjunto de candidatas.
 #   find_blocks <candidatas_separadas_por_salto_de_linea>
 # Lee de stdin lineas "ip<TAB>isp" (salida de HAYAHORA_ACTIVE_JQ) e imprime

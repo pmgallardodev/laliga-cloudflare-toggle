@@ -149,6 +149,30 @@ check "restore_due: pasado el limite rehabilita" "due" "$(due 1000 5000 900)"
 check "restore_due: marca no numerica espera" "wait" "$(due "abc" 5000 900)"
 check "restore_due: marca en el futuro espera" "wait" "$(due 6000 5000 900)"
 
+# --- feed_is_valid: forma del feed de hayahora (T6) ---
+valid() { printf '%s' "$1" | feed_is_valid && echo valid || echo invalid; }
+check "feed_is_valid: fixture valido" "valid" "$(valid "$fixture")"
+check "feed_is_valid: data vacia" "valid" "$(valid '{"data":[]}')"
+check "feed_is_valid: description null" "valid" \
+    "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","description":null,"stateChanges":[]}]}')"
+check "feed_is_valid: sin description" "valid" "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","stateChanges":[]}]}')"
+check "feed_is_valid: cuerpo vacio" "invalid" "$(valid '')"
+check "feed_is_valid: no JSON" "invalid" "$(valid 'not json')"
+check "feed_is_valid: objeto de error" "invalid" "$(valid '{"error":"maintenance"}')"
+check "feed_is_valid: data null" "invalid" "$(valid '{"data":null}')"
+check "feed_is_valid: data string" "invalid" "$(valid '{"data":"unavailable"}')"
+check "feed_is_valid: array en la raiz" "invalid" "$(valid '[]')"
+check "feed_is_valid: dos documentos" "invalid" "$(valid '{"data":[]}{"data":[]}')"
+check "feed_is_valid: stateChanges objeto" "invalid" \
+    "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","stateChanges":{"state":true}}]}')"
+check "feed_is_valid: stateChanges con no objetos" "invalid" \
+    "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","stateChanges":[true]}]}')"
+check "feed_is_valid: ip numerica" "invalid" "$(valid '{"data":[{"ip":1,"isp":"X","stateChanges":[]}]}')"
+check "feed_is_valid: isp ausente" "invalid" "$(valid '{"data":[{"ip":"1.2.3.4","stateChanges":[]}]}')"
+check "feed_is_valid: description numerica" "invalid" \
+    "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","description":5,"stateChanges":[]}]}')"
+check "feed_is_valid: entrada no objeto" "invalid" "$(valid '{"data":["1.2.3.4"]}')"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]
