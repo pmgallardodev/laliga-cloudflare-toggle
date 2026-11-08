@@ -35,7 +35,7 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
       matches per domain, then "+N more").
 - [x] T4: add a restore hysteresis. `MIN_CLEAR_MINUTES` (default 15) is how long a domain must
       stay clear in consecutive checks before it is restored. A new block resets the clear timer.
-- [ ] T5: document the new options in `README.md` and `.env.example`.
+- [x] T5: document the new options in `README.md` and `.env.example`.
 
 ## Acceptance criteria
 
@@ -68,10 +68,14 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
   domains with a new disable. Harness: a second blocked domain alerts only itself, a still-blocked
   run sends no DISABLED alert, 150 matches summarize to "+147 mas". shellcheck: only the 2
   pre-existing warnings; `bash -n` ok.
-- T4 (delegated writer) feat(restore) commit, hash recorded in the T5 entry. `restore_due` RED:
+- T4 (delegated writer) `e5278c6` feat(restore): wait MIN_CLEAR_MINUTES of clear checks before restoring. `restore_due` RED:
   4 of 8 new checks failed (`command not found`); GREEN: 50 ok / 0 fallos. Clear marks live in
   `${STATE_FILE%.json}_clear.json`, written with `atomic_write`, reset on a new block, deleted
   after a full restore and by the end-of-run cleanup. Harness (23/23): one clear run with
   `MIN_CLEAR_MINUTES=15` does not restore; a 20-minute-old mark restores; `0` restores at once;
   DRY_RUN writes no mark; a down feed leaves marks untouched and keeps the timeout path.
   shellcheck: only the 2 pre-existing warnings; `bash -n` ok.
+- T5 (delegated writer) docs commit, hash recorded in the follow-up progress commit. README:
+  hysteresis section, read-only records, new failure rows, clear file, new alert format.
+  `.env.example`: `MIN_CLEAR_MINUTES=15`. Passive docs: structural readback only (no RED/GREEN);
+  tests 50 ok / 0 fallos, shellcheck only the 2 pre-existing warnings, `bash -n` ok.

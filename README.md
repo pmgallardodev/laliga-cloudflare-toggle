@@ -32,7 +32,7 @@ Este script detecta los bloqueos en tiempo real y desactiva el proxy CDN automat
 1. Consulta la API de [hayahora.futbol](https://hayahora.futbol/) para saber si hay bloqueo activo
 2. Resuelve las IPs de **cada dominio** desde varios resolvers y comprueba si alguna esta bloqueada (ver abajo)
 3. Si lo esta, desactiva el proxy **de ese dominio** via Cloudflare API (nube naranja -> gris)
-4. Cuando el bloqueo de ese dominio termina, reactiva su proxy exactamente como estaba
+4. Cuando el bloqueo de ese dominio termina y sigue libre durante `MIN_CLEAR_MINUTES` (15 por defecto), reactiva su proxy exactamente como estaba
 
 ### Deteccion de IPs (por que no basta con un `dig`)
 
@@ -59,13 +59,27 @@ Cloudflare reparte IPs vecinas del mismo bloque, asi que un bloqueo en `.5` sign
 
 La decision es **por dominio**: solo se desactiva el proxy de los dominios cuyo propio conjunto coincide, y cada dominio se reactiva cuando termina su propio bloqueo.
 
+### Histeresis al rehabilitar (`MIN_CLEAR_MINUTES`)
+
+hayahora.futbol a veces alterna entre ejecuciones las IPs vecinas de un mismo bloque (p.ej. `104.21.13.229` bloqueada en una consulta y no en la siguiente). Sin margen, el proxy entraria en un ciclo de quitar y poner cada pocos minutos. Por eso, cuando un dominio deshabilitado aparece libre, el script anota desde cuando lo esta y solo lo rehabilita cuando lleva `MIN_CLEAR_MINUTES` libre sin interrupcion:
+
+```
+[INFO]   Libre desde hace 5m, rehabilitando en 10m (MIN_CLEAR_MINUTES=15).
+```
+
+- Si el dominio vuelve a aparecer bloqueado, el contador se reinicia.
+- `MIN_CLEAR_MINUTES=0` rehabilita en cuanto el dominio queda libre (comportamiento anterior).
+- Si hayahora.futbol esta caida no se cuenta nada: manda el timeout de `MAX_DISABLED_HOURS`.
+- En `DRY_RUN` solo se indica lo que haria, sin guardar nada.
+
 ## Caracteristicas
 
 - **Deteccion precisa**: solo actua si las IPs de tus dominios concretos (o sus vecinas del mismo bloque de Cloudflare) estan bloqueadas, dominio a dominio
 - **Crash-safe**: state file se escribe tras cada operacion con escritura atomica (tmp + mv)
 - **Idempotente**: ejecutar multiples veces no causa cambios innecesarios
 - **Multi-dominio**: gestiona todos tus dominios de Cloudflare a la vez
-- **Notificaciones Telegram**: avisa cuando desactiva y cuando reactiva
+- **Notificaciones Telegram**: avisa cuando desactiva y cuando reactiva, sin repetir la alerta mientras el bloqueo sigue
+- **Sin parpadeo**: espera `MIN_CLEAR_MINUTES` libre antes de reactivar el proxy
 - **Lock file**: previene ejecuciones concurrentes
 - **Timeout de seguridad**: si hayahora.futbol se cae, restaura el proxy tras 12h maximo
 - **DRY_RUN**: modo prueba para verificar sin tocar nada
@@ -112,6 +126,7 @@ TELEGRAM_CHAT_ID="-123456789"
 DRY_RUN=false            # true = solo detecta, no toca nada
 CHECK_INTERVAL=300       # segundos entre checks (solo Docker)
 MAX_DISABLED_HOURS=12    # maximo tiempo sin proxy si hayahora.futbol cae
+MIN_CLEAR_MINUTES=15     # minutos libre seguidos antes de rehabilitar (0 = al momento)
 ```
 
 El formato de `DOMAINS` es `ZONE_ID:DOMINIO` separados por comas, sin espacios obligatorios (se recortan): `DOMAINS="abc123:example.com,def456:example.org"`. El script gestiona el dominio y todos sus subdominios.
@@ -161,6 +176,7 @@ En **Coolify**: crear recurso Docker, apuntar al repo, configurar variables de e
 | Scope | Dominio configurado + todos sus subdominios |
 | Condicion | `proxiable: true` y actualmente `proxied: true` |
 | Registros manuales en gris | Nunca se tocan |
+| Registros de solo lectura (`meta.read_only`, p.ej. creados por un Worker) | Se saltan: Cloudflare no permite editarlos (error 1043) |
 
 ## Seguridad ante fallos
 
@@ -172,7 +188,9 @@ En **Coolify**: crear recurso Docker, apuntar al repo, configurar variables de e
 | hayahora.futbol caido | No toca nada (fail-safe). Si el proxy de un dominio lleva >12h desactivado, lo restaura por timeout |
 | State de una version anterior | Los registros sin campo `domain` se asignan por nombre; un archivo de IPs antiguo (lista) se aplica a todos los dominios; sin archivo de IPs se usa el check amplio de Cloudflare |
 | State file corrupto | Se trata como vacio. No rompe nada |
-| Registro eliminado en Cloudflare | Log de error, continua con los demas |
+| Registro eliminado en Cloudflare | Log de error con el detalle de `errors` de la API, continua con los demas |
+| Telegram rechaza un mensaje | Log `ERROR` con la `description` de Telegram. El script sigue |
+| hayahora.futbol alterna IPs vecinas | Histeresis: no rehabilita hasta `MIN_CLEAR_MINUTES` libre seguido |
 
 ## Estructura
 
@@ -186,7 +204,8 @@ laliga-cloudflare-toggle/
 ├── .env.example         # Plantilla de configuracion
 ├── state/               # State files (persisten entre ejecuciones)
 │   ├── proxy_disabled.json      # Registros desactivados por el script
-│   └── proxy_disabled_ips.json  # IPs de Cloudflare guardadas por dominio: {"dominio": ["ip", ...]}
+│   ├── proxy_disabled_ips.json  # IPs de Cloudflare guardadas por dominio: {"dominio": ["ip", ...]}
+│   └── proxy_disabled_clear.json  # Desde cuando esta libre cada dominio: {"dominio": epoch}
 └── logs/                # Logs de ejecucion
     └── toggle-proxy.log
 ```
@@ -205,15 +224,21 @@ Configura `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` para recibir alertas:
 **Cuando desactiva el proxy:**
 > 🔴 **Proxy Cloudflare DESHABILITADO**
 >
-> LaLiga ha activado bloqueos. Se ha quitado el proxy en 12 registro(s):
+> LaLiga ha activado bloqueos. Se ha quitado el proxy en 2 registro(s) nuevo(s), 12 en total:
 > - A example.com -> 1.2.3.4
 > - A www.example.com -> 1.2.3.4
-> - ...
+>
+> Motivo:
+> example.com: 5 coincidencias: DIGI 188.114.96.5 (same24), Movistar 188.114.97.5 (exact), Orange 188.114.96.7 (same24) +2 mas
+
+La alerta solo lista los registros deshabilitados en esa ejecucion: mientras el bloqueo sigue no se repite. El motivo se resume por dominio (total de coincidencias, las 3 primeras y "+N mas").
 
 **Cuando lo reactiva:**
 > 🟢 **Proxy Cloudflare REHABILITADO**
 >
 > El bloqueo ha terminado. Se ha restaurado el proxy en 12 registro(s).
+
+Las listas largas se recortan (con "… (truncado)") para no pasar del limite de 4096 caracteres de Telegram. Si Telegram rechaza un mensaje, el log muestra `ERROR` con su `description`.
 
 ## FAQ
 
