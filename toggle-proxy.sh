@@ -291,6 +291,10 @@ if ! take_lock; then
     fi
 fi
 trap cleanup EXIT
+# TERM/INT (docker stop via entrypoint.sh): bash atiende la senal al acabar
+# el comando en curso (un curl, max 30 s) y sale; el trap EXIT libera el lock.
+# Un PATCH sin confirmar queda "pending" y se reconcilia en la siguiente.
+trap 'log "WARN" "Senal recibida: saliendo."; exit 143' TERM INT
 
 # --- Verificar dependencias -------------------------------------------------
 
