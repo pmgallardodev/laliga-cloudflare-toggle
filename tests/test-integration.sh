@@ -498,6 +498,21 @@ t_corrupt_state_dry_run_untouched() {
     ok "DRY_RUN no mueve el state corrupto" '[[ $(cat "$STATE") == "{garbage" ]] && out_has "ERROR.*corrupto"'
 }
 
+# --- T14: paginacion de dns_records ---------------------------------------------------
+
+t_pagination_101_records() {
+    setup pagination-101
+    local i recs
+    recs="$(rec r0 example.test true)"
+    for i in $(seq 1 100); do recs="${recs},$(rec "r$i" "s$i.example.test" true)"; done
+    records "[$recs]"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "pide la segunda pagina" 'grep -q "dns_records?per_page=100&page=2" "${HDATA}/calls.log"'
+    ok "deshabilita los 101 registros" '[[ $(grep -c "^PATCH " "${HDATA}/calls.log") == 101 ]]'
+    ok "ninguno queda con proxy" '[[ $(jq "[.[] | select(.proxied)] | length" "${HDATA}/records.json") == 0 ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

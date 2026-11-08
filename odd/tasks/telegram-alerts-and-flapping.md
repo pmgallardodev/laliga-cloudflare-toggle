@@ -58,7 +58,7 @@ The user authorized fixing all findings, then commit and push of this branch (20
       next run (ambiguous PATCH, crash, or log failure). A log write failure must not abort bookkeeping.
 - [x] T13: corrupt state. Quarantine the file, log ERROR and alert; never treat it as `[]` and never delete
       the support files.
-- [ ] T14: pagination of dns_records.
+- [x] T14: pagination of dns_records.
 - [ ] T15: hysteresis. A feed outage resets the clear timer (only consecutive healthy, clear checks count).
 - [ ] T16: per-record restore accounting and alerts (a partial restore is alerted).
 - [ ] T17: candidate discovery covers proxied subdomains when the apex has no Cloudflare IPs (bounded).
@@ -130,3 +130,4 @@ change). Each entry lists the commit and the observed checks.
 - T11 `<T10>` PATCH bodies are the literals `{"proxied":false}` and `{"proxied":true}`; a renamed record logs WARN and keeps its new name. RED: 3 fails (full body sent, rename reverted). GREEN as above.
 - T12 `<T12>` fix(state): write-ahead intent. The state entry is written with `status: pending` before the PATCH and confirmed after it; a 4xx rejection removes it; no response (curl 28/5xx) keeps it. `reconcile_pending` GETs pending records at the start of each domain: grey -> confirmed and alerted, proxied -> dropped (re-disabled if still blocked), 404/81044 -> dropped. `cf_api` now returns via `CF_BODY`/`CF_HTTP` (no stdout), `log` no longer uses `tee` and never aborts. RED: 11 of 13 checks failed (ambiguous PATCH left an untracked grey record; a read-only log file exited 1 before the state write). GREEN: integration 78/0 on both shells, unit 202/0, scratch harness 23/0.
 - T13 `<T13>` fix(state): `quarantine_if_invalid` checks state (array of objects with string record_id), ips (legacy array or object of string arrays) and clear (object) once at start. Invalid -> moved to `<file>.corrupt-<epoch>`, ERROR, one Telegram alert (also on the feed-down early exit) naming the domains that still have saved IPs. Documented behaviour: no automatic reconciliation of lost ownership; while a `proxy_disabled.json.corrupt-*` exists the support files are never deleted; a corrupt ips/clear file does not stop restoring the parsable state. DRY_RUN only logs. RED: 10 of 13 checks failed (state read as [], all three files deleted). GREEN: integration 92/0 on both shells.
+- T14 `<T14>` fix(cloudflare): `cf_list_records` follows `result_info.total_pages` (page 1 is `?per_page=100`, then `&page=N`, cap 50 pages, any page failure fails the listing), cached per domain iteration. RED: 3 fails (only 100 of 101 PATCHed, page 2 never requested). GREEN: integration 95/0 on both shells, unit 202/0, scratch harness 23/0, shellcheck clean.

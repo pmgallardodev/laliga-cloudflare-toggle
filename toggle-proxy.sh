@@ -253,6 +253,36 @@ cf_api() {
     fi
 }
 
+# Todos los registros DNS de una zona, recorriendo las paginas que indica
+# result_info.total_pages (100 por pagina, maximo CF_MAX_PAGES). Deja el
+# array en ZONE_RECORDS. Si falla una pagina falla todo: no se actua sobre
+# una lista a medias. Cache por zona dentro de un mismo dominio.
+CF_MAX_PAGES=50
+ZONE_RECORDS="[]"
+ZONE_RECORDS_ZONE=""
+cf_list_records() {
+    local zone_id="$1" page=1 total_pages=1 all="[]" endpoint
+    [[ "$ZONE_RECORDS_ZONE" == "$zone_id" ]] && return 0
+    while :; do
+        endpoint="/zones/${zone_id}/dns_records?per_page=100"
+        [[ "$page" -gt 1 ]] && endpoint="${endpoint}&page=${page}"
+        cf_api GET "$endpoint" || return 1
+        all="$(printf '%s' "$CF_BODY" | jq -c --argjson all "$all" '$all + (.result // [])')" || return 1
+        if [[ "$page" -eq 1 ]]; then
+            total_pages="$(printf '%s' "$CF_BODY" | jq -r '.result_info.total_pages // 1' 2>/dev/null || echo 1)"
+            total_pages="$(parse_uint "$total_pages" 1 999999 || echo 1)"
+            if [[ "$total_pages" -gt "$CF_MAX_PAGES" ]]; then
+                log "WARN" "  La zona tiene $total_pages paginas de registros; solo se leen $CF_MAX_PAGES."
+                total_pages="$CF_MAX_PAGES"
+            fi
+        fi
+        [[ "$page" -ge "$total_pages" ]] && break
+        page=$((page + 1))
+    done
+    ZONE_RECORDS="$all"
+    ZONE_RECORDS_ZONE="$zone_id"
+}
+
 # Tras un cf_api fallido: 0 si Cloudflare rechazo la peticion (HTTP 4xx), asi
 # que no cambio nada. Sin respuesta o con 5xx el resultado es incierto.
 cf_rejected() {
@@ -572,17 +602,17 @@ disable_domain() {
     local records_json target_records record_count i record record_id record_name
     local record_type record_content body
 
-    if ! cf_api GET "/zones/${zone_id}/dns_records?per_page=100"; then
+    if ! cf_list_records "$zone_id"; then
         log "ERROR" "No se pudieron obtener registros DNS para $domain. Saltando."
         any_error=true
         return 0
     fi
-    records_json="$CF_BODY"
+    records_json="$ZONE_RECORDS"
 
     # Solo registros proxied del dominio y subdominios. Los read-only (p.ej.
     # creados por un Worker) no se pueden editar: Cloudflare responde 400/1043
-    target_records="$(echo "$records_json" | jq -c --arg domain "$domain" "${CANON_JQ}"'
-        [.result[]
+    target_records="$(printf '%s' "$records_json" | jq -c --arg domain "$domain" "${CANON_JQ}"'
+        [.[]
          | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
          | .name |= canon
          | select(.name == $domain or (.name | endswith("." + $domain)))
@@ -784,6 +814,8 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
     domain="${DOMAIN_NAMES[$idx]}"
     state_n="$(domain_state_count "$zone_id" "$domain")"
     domain_reason_added=false
+    # Cache de registros solo dentro de un dominio (los PATCH la dejan vieja)
+    ZONE_RECORDS_ZONE=""
 
     log "INFO" "--- $domain ---"
 
