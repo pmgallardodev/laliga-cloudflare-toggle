@@ -168,6 +168,20 @@ telegram_payload() {
         '{chat_id: $chat_id, text: $text, parse_mode: "HTML"}'
 }
 
+# Recortar texto a un maximo de caracteres (no bytes) para Telegram.
+#   truncate_text <texto> <max_caracteres>
+# Si no cabe, corta y anade "\n… (truncado)" sin pasarse del maximo.
+# jq cuenta y corta por caracteres Unicode, asi que no parte emojis ni
+# flechas aunque el locale del contenedor sea C. Recortar el texto en crudo,
+# antes de html_escape: asi nunca se corta una entidad (&amp;) por la mitad.
+truncate_text() {
+    jq -nj --arg s "$1" --argjson max "$2" --arg suffix $'\n… (truncado)' '
+        if ($s | length) <= $max then $s
+        elif ($suffix | length) >= $max then $s[0:$max]
+        else $s[0:($max - ($suffix | length))] + $suffix
+        end'
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)

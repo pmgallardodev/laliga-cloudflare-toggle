@@ -36,6 +36,10 @@ DRY_RUN="${DRY_RUN:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 HAYAHORA_API="${HAYAHORA_API:-https://hayahora.futbol/estado/data.json}"
+# Presupuesto de caracteres para las partes variables de un mensaje de
+# Telegram (limite 4096 tras parsear el HTML). Con dos partes, cada una
+# recibe la mitad; el resto del texto es fijo y corto.
+TELEGRAM_TEXT_BUDGET=3500
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 # Dominios protegidos: NUNCA se les quita el proxy/CDN
@@ -65,13 +69,23 @@ notify_telegram() {
             log "WARN" "No se pudo construir la notificacion de Telegram"
             return 0
         }
-        curl -s --max-time 10 \
+        # Capturar la respuesta: Telegram contesta HTTP 400 con ok=false (p.ej.
+        # mensaje > 4096 caracteres) y antes se perdia sin dejar rastro
+        local response tg_ok tg_desc
+        response="$(curl -s --max-time 10 \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H 'Content-Type: application/json' \
-            --data-binary "$payload" >/dev/null 2>&1 || {
-            log "WARN" "No se pudo enviar notificacion de Telegram"
+            --data-binary "$payload" 2>/dev/null)" || {
+            log "WARN" "No se pudo enviar notificacion de Telegram (error de red)"
+            return 0
         }
+        tg_ok="$(printf '%s' "$response" | jq -r '.ok' 2>/dev/null || true)"
+        if [[ "$tg_ok" != "true" ]]; then
+            tg_desc="$(printf '%s' "$response" | jq -r '.description // empty' 2>/dev/null || true)"
+            log "ERROR" "Telegram rechazo la notificacion: ${tg_desc:-respuesta no valida: ${response:0:200}}"
+        fi
     fi
+    return 0
 }
 
 # Comprobar si un registro DNS pertenece a un dominio protegido
@@ -695,10 +709,10 @@ if [[ "$total_disabled" -gt 0 ]]; then
 
 LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $final_count registro(s):
 
-<code>$(html_escape "$records_list")</code>
+<code>$(html_escape "$(truncate_text "$records_list" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
 
 Motivo:
-$(html_escape "$disable_reasons")
+$(html_escape "$(truncate_text "$disable_reasons" $((TELEGRAM_TEXT_BUDGET / 2)))")
 EOF
 )"
 fi
@@ -709,7 +723,7 @@ if [[ "$total_reapplied" -gt 0 ]]; then
 
 Se ha vuelto a quitar (naranja → gris) en $total_reapplied registro(s):
 
-<code>$(html_escape "$reapplied_names")</code>
+<code>$(html_escape "$(truncate_text "$reapplied_names" "$TELEGRAM_TEXT_BUDGET")")</code>
 EOF
 )"
 fi
@@ -720,10 +734,10 @@ if [[ "$total_restored" -gt 0 ]]; then
 
 El bloqueo de LaLiga ha terminado. Se ha restaurado el proxy (nube gris → naranja) en $total_restored registro(s):
 
-<code>$(html_escape "$restored_lines")</code>
+<code>$(html_escape "$(truncate_text "$restored_lines" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
 ${enable_reasons:+
 Motivo:
-$(html_escape "$enable_reasons")}
+$(html_escape "$(truncate_text "$enable_reasons" $((TELEGRAM_TEXT_BUDGET / 2)))")}
 EOF
 )"
 fi

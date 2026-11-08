@@ -100,6 +100,24 @@ check "telegram_payload: chat_id y parse_mode no inyectables" "-1001 HTML" \
     "$(echo "$payload" | jq -r '"\(.chat_id) \(.parse_mode)"')"
 check "telegram_payload: una sola linea" "1" "$(printf '%s\n' "$payload" | wc -l | xargs)"
 
+# --- truncate_text: limite de caracteres (no bytes) para Telegram ---
+# Cuenta caracteres Unicode con jq (independiente del locale)
+chars() { printf '%s' "$1" | jq -Rs 'length'; }
+check "truncate_text: corto intacto" "hola" "$(truncate_text "hola" 10)"
+check "truncate_text: justo en el limite intacto" "0123456789" "$(truncate_text "0123456789" 10)"
+check "truncate_text: conserva saltos de linea finales" "$(printf 'a\nb\n')." "$(truncate_text "$(printf 'a\nb\n')" 10; echo .)"
+long="$(printf 'x%.0s' $(seq 1 200))"
+cut_text="$(truncate_text "$long" 50)"
+check "truncate_text: largo cabe en el limite" "50" "$(chars "$cut_text")"
+check "truncate_text: largo lleva sufijo" "yes" "$([[ "$cut_text" == *"(truncado)" ]] && echo yes || echo no)"
+check "truncate_text: largo empieza por el original" "yes" "$([[ "$cut_text" == xxxx* ]] && echo yes || echo no)"
+multi="$(printf '→🙂ñ%.0s' $(seq 1 100))"
+cut_multi="$(truncate_text "$multi" 40)"
+check "truncate_text: multibyte cuenta caracteres" "40" "$(chars "$cut_multi")"
+check "truncate_text: multibyte sigue siendo UTF-8 valido" "ok" \
+    "$(printf '%s' "$cut_multi" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && echo ok || echo roto)"
+check "truncate_text: multibyte intacto si cabe" "$(printf '→🙂ñ')" "$(truncate_text "$(printf '→🙂ñ')" 3)"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]
