@@ -255,6 +255,81 @@ t_cidr_origin_not_cloudflare() {
     ok "IP fuera de 108.162.192.0/18 no es candidata: nada se toca" '[[ $(patches r2) == 0 ]]'
 }
 
+# --- T8: numeros base 10 con limites --------------------------------------------
+
+t_numeric_minutes_08() {
+    setup minutes-08
+    overdue_state 1999990000
+    feed
+    run_app MIN_CLEAR_MINUTES=08
+    ok "MIN_CLEAR_MINUTES=08 no aborta" '[[ $RC == 0 ]] && ! out_has "value too great" && out_has "Libre desde hace"'
+    ok "guarda la marca de libre" '[[ $(jq -r ".[\"example.test\"]" "$CLEAR") == 2000000000 ]]'
+    set_now 2000000479
+    run_app MIN_CLEAR_MINUTES=08
+    ok "a los 7m59s no restaura" '[[ $(patches r1) == 0 ]]'
+    set_now 2000000480
+    run_app MIN_CLEAR_MINUTES=08
+    ok "a los 8 minutos restaura" '[[ $(patches r1) == 1 ]]'
+}
+
+t_numeric_max_hours() {
+    setup max-hours-012
+    overdue_state 1999956800   # hace 43200 s = 12 h
+    feed_raw 'down'
+    run_app MAX_DISABLED_HOURS=012
+    ok "MAX_DISABLED_HOURS=012 son 12 h: restaura" '[[ $RC == 0 && $(patches r1) == 1 ]]'
+    setup max-hours-invalid
+    overdue_state 1999956801
+    feed_raw 'down'
+    run_app MAX_DISABLED_HOURS=abc
+    ok "MAX_DISABLED_HOURS invalido avisa y usa 12" 'out_has "MAX_DISABLED_HOURS" && [[ $RC == 0 && $(patches r1) == 0 ]]'
+}
+
+t_numeric_defaults_when_unset() {
+    setup defaults-unset
+    overdue_state
+    feed_raw 'down'
+    OUT="$(cd "$APP" && env -i PATH="${STUB_BIN}:${PATH}" HDATA="$HDATA" DOMAINS=Z:example.test \
+        CLOUDFLARE_API_TOKEN=FAKE "$TEST_BASH" ./toggle-proxy.sh 2>&1)"
+    RC=$?
+    ok "sin MAX_DISABLED_HOURS ni MIN_CLEAR_MINUTES usa los defaults" '[[ $RC == 0 ]] && out_has "Superado limite de 12h"'
+}
+
+# --- T9: marcas de tiempo ISO legacy ---------------------------------------------
+
+t_legacy_iso_timestamp_utc() {
+    local tz
+    for tz in UTC Europe/Madrid; do
+        setup "legacy-iso-${tz//\//-}"
+        overdue_state '"2026-11-07T12:00:00Z"'
+        feed_raw 'down'
+        set_now 1794094200   # 11.5 h despues
+        TZ="$tz" run_app
+        ok "TZ=$tz: a las 11.5 h no restaura" '[[ $RC == 0 && $(patches r1) == 0 ]]'
+        set_now 1794096000   # 12 h despues
+        TZ="$tz" run_app
+        ok "TZ=$tz: a las 12 h restaura" '[[ $(patches r1) == 1 ]]'
+    done
+}
+
+t_unparseable_timestamp_expires() {
+    setup unparseable-timestamp
+    overdue_state '"ayer por la tarde"'
+    feed_raw 'down'
+    run_app
+    ok "disabled_at ilegible: ERROR y se da por vencido" 'out_has "ERROR.*disabled_at" && [[ $(patches r1) == 1 ]]'
+}
+
+t_timeout_uses_oldest_entry() {
+    setup timeout-oldest
+    records "[$(rec r1 example.test false),$(rec r2 www.example.test false)]"
+    printf '[%s,%s]\n' "$(st r1 example.test 1999990000)" "$(st r2 www.example.test 1999900000)" > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+    feed_raw 'down'
+    run_app
+    ok "el timeout cuenta desde la entrada mas antigua" '[[ $(patches r1) == 1 && $(patches r2) == 1 ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

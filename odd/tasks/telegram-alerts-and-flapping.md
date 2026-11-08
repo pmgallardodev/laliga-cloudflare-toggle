@@ -46,9 +46,9 @@ The user authorized fixing all findings, then commit and push of this branch (20
       unavailable-feed timeout path, and no jq call can crash the run.
 - [x] T7: CIDR correctness. Do exact numeric membership for every published Cloudflare IPv4/IPv6 range,
       with boundary tests.
-- [ ] T8: numeric env parsing. Base 10 with bounds for `MIN_CLEAR_MINUTES`, `MAX_DISABLED_HOURS`,
+- [x] T8: numeric env parsing. Base 10 with bounds for `MIN_CLEAR_MINUTES`, `MAX_DISABLED_HOURS`,
       `CHECK_INTERVAL` and persisted epochs (`08` must work).
-- [ ] T9: timestamps. Parse legacy ISO `...Z` disabled_at as UTC on GNU, BusyBox and BSD; an unparseable
+- [x] T9: timestamps. Parse legacy ISO `...Z` disabled_at as UTC on GNU, BusyBox and BSD; an unparseable
       value must not wait forever.
 - [ ] T10: name handling. Comparisons are case-insensitive and ignore a trailing dot (protected domains,
       scope, state keys).
@@ -124,3 +124,5 @@ change). Each entry lists the commit and the observed checks.
   silences the 2 pre-existing shellcheck warnings with directives (SC1090 `.env`, SC2034).
 - T6 `<T6>` fix(feed): validate hayahora responses. `feed_is_valid` (jq -se, one object, typed fields) RED: `command not found` (13 unit checks failed / 4 passed by accident), integration 18 of 23 failed (exit 5 on `{"error":..}`, data null/string, object stateChanges, null description; empty body treated as healthy). GREEN: unit 67/0, integration 43/0 on bash 5 and 3.2. Feed fetched with `curl -sf` so HTTP >= 400 is unavailable; null description tolerated in the broad check. shellcheck clean, `bash -n` ok, scratch harness 23/0.
 - T7 `<T7>` fix(cidr): exact numeric membership. RED: unit aborted (`CF_IPV4_RANGES: unbound variable`), integration `cidr-origin-not-cloudflare` failed (www PATCHed for a 108.162.1.x origin). GREEN: unit 169/0 (first/last/just-outside for all 15 v4 and 7 v6 ranges, 104.16/13 and 104.24/14 adjacency handled), integration 44/0, both shells. Single list `CF_IPV4_RANGES`/`CF_IPV6_RANGES`; `ipv4_parse`/`ipv6_parse` without subshells; `ipv6_prefix48` reuses `ipv6_parse`. shellcheck clean, scratch harness 23/0.
+- T8 `<T8>` (with T9) fix(config): `parse_uint` (base 10, <=15 digits, bounds). MIN_CLEAR_MINUTES 0-10080, MAX_DISABLED_HOURS 1-720 (invalid -> WARN and default); clear marks and numeric disabled_at go through it. RED: unit `command not found`; integration `minutes-08` 3 fails (bash 5 and 3.2), `max-hours-invalid` failed. GREEN: unit 198/0, integration 57/0 on both shells.
+- T9 `<T8>` pure-bash `iso_to_epoch` (days_from_civil, Z/offset/fraction, no `date` dependency, so GNU/BusyBox/BSD behave the same; BusyBox not run locally) and `epoch_of`. Timeout uses the oldest entry of the domain; an unreadable disabled_at logs ERROR and counts as expired. RED: TZ=Europe/Madrid restored at 11.5 h; garbage timestamp waited forever; oldest entry ignored. GREEN as above.

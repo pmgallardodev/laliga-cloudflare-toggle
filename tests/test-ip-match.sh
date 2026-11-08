@@ -228,6 +228,44 @@ check "feed_is_valid: description numerica" "invalid" \
     "$(valid '{"data":[{"ip":"1.2.3.4","isp":"X","description":5,"stateChanges":[]}]}')"
 check "feed_is_valid: entrada no objeto" "invalid" "$(valid '{"data":["1.2.3.4"]}')"
 
+# --- parse_uint: enteros base 10 con limites (T8) ---
+pu() { parse_uint "$@" || echo "invalid"; }
+check "parse_uint: 08 es 8 (no octal)" "8" "$(pu 08 0 100)"
+check "parse_uint: 010 es 10" "10" "$(pu 010 0 100)"
+check "parse_uint: 0" "0" "$(pu 0 0 100)"
+check "parse_uint: 0000 es 0" "0" "$(pu 0000 0 100)"
+check "parse_uint: limite superior incluido" "100" "$(pu 100 0 100)"
+check "parse_uint: por encima del limite" "invalid" "$(pu 101 0 100)"
+check "parse_uint: por debajo del minimo" "invalid" "$(pu 0 1 100)"
+check "parse_uint: vacio" "invalid" "$(pu '' 0 100)"
+check "parse_uint: negativo" "invalid" "$(pu -1 0 100)"
+check "parse_uint: decimal" "invalid" "$(pu 1.5 0 100)"
+check "parse_uint: espacios" "invalid" "$(pu ' 5' 0 100)"
+check "parse_uint: desbordamiento" "invalid" "$(pu 99999999999999999999999 0 100)"
+check "parse_uint: texto" "invalid" "$(pu abc 0 100)"
+
+# --- iso_to_epoch: marcas ISO 8601 legacy, siempre UTC (T9) ---
+iso() { iso_to_epoch "$1" || echo "invalid"; }
+check "iso_to_epoch: Z" "1794052800" "$(iso 2026-11-07T12:00:00Z)"
+check "iso_to_epoch: Z con TZ=Europe/Madrid" "1794052800" "$(TZ=Europe/Madrid iso_to_epoch 2026-11-07T12:00:00Z)"
+check "iso_to_epoch: epoch 0" "0" "$(iso 1970-01-01T00:00:00Z)"
+check "iso_to_epoch: bisiesto" "1709251199" "$(iso 2024-02-29T23:59:59Z)"
+check "iso_to_epoch: offset +01:00" "1794052800" "$(iso 2026-11-07T13:00:00+01:00)"
+check "iso_to_epoch: offset -0230" "1794061800" "$(iso 2026-11-07T12:00:00-0230)"
+check "iso_to_epoch: fraccion de segundo" "1794052800" "$(iso 2026-11-07T12:00:00.123Z)"
+check "iso_to_epoch: verano (julio)" "1783425600" "$(iso 2026-07-07T12:00:00Z)"
+check "iso_to_epoch: basura" "invalid" "$(iso garbage)"
+check "iso_to_epoch: mes 13" "invalid" "$(iso 2026-13-07T12:00:00Z)"
+check "iso_to_epoch: hora 24" "invalid" "$(iso 2026-11-07T24:00:00Z)"
+
+# --- epoch_of: disabled_at numerico o ISO ---
+eo() { epoch_of "$1" || echo "invalid"; }
+check "epoch_of: numerico" "1794052800" "$(eo 1794052800)"
+check "epoch_of: numerico con ceros" "8" "$(eo 08)"
+check "epoch_of: ISO" "1794052800" "$(eo 2026-11-07T12:00:00Z)"
+check "epoch_of: null" "invalid" "$(eo null)"
+check "epoch_of: vacio" "invalid" "$(eo '')"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]

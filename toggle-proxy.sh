@@ -369,14 +369,19 @@ if [[ ${#DOMAIN_NAMES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-MAX_DISABLED_SECONDS="${MAX_DISABLED_HOURS:-12}"
-MAX_DISABLED_SECONDS=$((MAX_DISABLED_SECONDS * 3600))
+# Numeros de entorno: base 10 con limites ("08" es 8, no octal invalido)
+MAX_DISABLED_HOURS_RAW="${MAX_DISABLED_HOURS:-12}"
+if ! MAX_DISABLED_HOURS="$(parse_uint "$MAX_DISABLED_HOURS_RAW" 1 720)"; then
+    log "WARN" "MAX_DISABLED_HOURS='$MAX_DISABLED_HOURS_RAW' no es un numero de horas (1-720). Usando 12."
+    MAX_DISABLED_HOURS=12
+fi
+MAX_DISABLED_SECONDS=$((MAX_DISABLED_HOURS * 3600))
 
 # Histeresis: minutos que un dominio debe seguir libre antes de rehabilitarlo.
 # Evita el ciclo deshabilitar/rehabilitar cuando hayahora alterna IPs vecinas.
-MIN_CLEAR_MINUTES="${MIN_CLEAR_MINUTES:-15}"
-if [[ ! "$MIN_CLEAR_MINUTES" =~ ^[0-9]+$ ]]; then
-    log "WARN" "MIN_CLEAR_MINUTES='$MIN_CLEAR_MINUTES' no es un numero de minutos. Usando 15."
+MIN_CLEAR_MINUTES_RAW="${MIN_CLEAR_MINUTES:-15}"
+if ! MIN_CLEAR_MINUTES="$(parse_uint "$MIN_CLEAR_MINUTES_RAW" 0 10080)"; then
+    log "WARN" "MIN_CLEAR_MINUTES='$MIN_CLEAR_MINUTES_RAW' no es un numero de minutos (0-10080). Usando 15."
     MIN_CLEAR_MINUTES=15
 fi
 MIN_CLEAR_SECONDS=$((MIN_CLEAR_MINUTES * 60))
@@ -676,27 +681,29 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
             log "INFO" "  hayahora caida y proxy activo. Sin accion (fail-safe)."
             continue
         fi
-        oldest_ts="$(read_state | jq -r --arg zid "$zone_id" --arg d "$domain" \
-            "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))][0].disabled_at')"
-        # disabled_at puede ser epoch (numerico) o ISO 8601 (legacy)
-        if [[ "$oldest_ts" =~ ^[0-9]+$ ]]; then
-            oldest_epoch="$oldest_ts"
-        else
-            oldest_epoch="$(date -d "$oldest_ts" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$oldest_ts" +%s 2>/dev/null || echo "")"
-        fi
-        # Si no se pudo parsear, no asumir timeout -- esperar
-        if [[ -z "$oldest_epoch" || "$oldest_epoch" == "0" ]]; then
-            log "WARN" "  No se pudo parsear disabled_at='$oldest_ts'. Esperando sin cambios."
-            continue
-        fi
+        # Timeout desde la entrada mas antigua del dominio. disabled_at puede ser
+        # epoch (actual) o ISO 8601 (legacy, siempre UTC). Uno ilegible se da
+        # por vencido: esperar para siempre dejaria el proxy quitado sin limite
+        oldest_epoch=""
+        while IFS= read -r ts_raw; do
+            if ! ts_epoch="$(epoch_of "$ts_raw")"; then
+                log "ERROR" "  disabled_at='$ts_raw' ilegible en el state de $domain. Se da por vencido el timeout."
+                ts_epoch=0
+            fi
+            if [[ -z "$oldest_epoch" || "$ts_epoch" -lt "$oldest_epoch" ]]; then
+                oldest_epoch="$ts_epoch"
+            fi
+        done < <(read_state | jq -r --arg zid "$zone_id" --arg d "$domain" \
+            "$STATE_MINE_JQ"' .[] | select(mine($zid; $d)) | .disabled_at | tostring')
+        [[ -n "$oldest_epoch" ]] || oldest_epoch=0
         elapsed=$(( $(date +%s) - oldest_epoch ))
         if [[ "$elapsed" -lt "$MAX_DISABLED_SECONDS" ]]; then
             remaining_h=$(( (MAX_DISABLED_SECONDS - elapsed) / 3600 ))
             log "INFO" "  Proxy deshabilitado hace $(( elapsed / 3600 ))h. Quedan ~${remaining_h}h hasta rehabilitar por timeout. Esperando."
             continue
         fi
-        log "WARN" "  Proxy deshabilitado hace $(( elapsed / 3600 ))h. Superado limite de ${MAX_DISABLED_HOURS:-12}h. Rehabilitando."
-        reason="hayahora caida, timeout ${MAX_DISABLED_HOURS:-12}h alcanzado"
+        log "WARN" "  Proxy deshabilitado hace $(( elapsed / 3600 ))h. Superado limite de ${MAX_DISABLED_HOURS}h. Rehabilitando."
+        reason="hayahora caida, timeout ${MAX_DISABLED_HOURS}h alcanzado"
     fi
 
     # 3. Actuar. Matriz por dominio:
@@ -737,7 +744,8 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
         # timeout de arriba): rehabilitar tras MIN_CLEAR_MINUTES libre seguido
         if [[ "$hayahora_ok" == "true" ]]; then
             now="$(date +%s)"
-            clear_since="$(clear_since_for "$domain")"
+            # Marca guardada: epoch base 10; cualquier otra cosa es "sin marca"
+            clear_since="$(parse_uint "$(clear_since_for "$domain")" 0 9999999999 || true)"
             if ! restore_due "$clear_since" "$now" "$MIN_CLEAR_SECONDS"; then
                 if [[ ! "$clear_since" =~ ^[0-9]+$ ]]; then
                     if [[ "$DRY_RUN" == "true" ]]; then

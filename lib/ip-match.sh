@@ -233,6 +233,61 @@ restore_due() {
     [[ $((now - clear_since)) -ge "$min_seconds" ]]
 }
 
+# Entero sin signo en base 10 con limites (env y epochs guardados).
+#   parse_uint <valor> <min> <max>
+# Imprime el valor normalizado (sin ceros a la izquierda) o devuelve 1.
+# "08" es 8: bash lo trataria como octal invalido en $(( )).
+parse_uint() {
+    local v="$1" min="$2" max="$3"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    v="${v#"${v%%[!0]*}"}"
+    [[ -n "$v" ]] || v=0
+    [[ ${#v} -le 15 ]] || return 1
+    [[ "$v" -ge "$min" && "$v" -le "$max" ]] || return 1
+    printf '%s\n' "$v"
+}
+
+# Fecha ISO 8601 a epoch, sin depender de date (GNU, BusyBox y BSD difieren).
+#   iso_to_epoch 2026-11-07T12:00:00Z  -> 1794052800
+# Admite fraccion de segundo y zona Z, +HH:MM o +HHMM; sin zona se toma UTC.
+iso_to_epoch() {
+    local re='^([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?$'
+    [[ "$1" =~ $re ]] || return 1
+    local y=$((10#${BASH_REMATCH[1]})) m=$((10#${BASH_REMATCH[2]})) d=$((10#${BASH_REMATCH[3]}))
+    local hh=$((10#${BASH_REMATCH[4]})) mi=$((10#${BASH_REMATCH[5]})) ss=$((10#${BASH_REMATCH[6]}))
+    local zone="${BASH_REMATCH[8]}" offset=0 sign oh om
+    [[ "$m" -ge 1 && "$m" -le 12 && "$d" -ge 1 && "$d" -le 31 ]] || return 1
+    [[ "$hh" -le 23 && "$mi" -le 59 && "$ss" -le 60 ]] || return 1
+    if [[ -n "$zone" && "$zone" != Z ]]; then
+        sign="${zone:0:1}"
+        zone="${zone:1}"
+        zone="${zone/:/}"
+        oh=$((10#${zone:0:2}))
+        om=$((10#${zone:2:2}))
+        offset=$(( oh * 3600 + om * 60 ))
+        [[ "$sign" == "-" ]] && offset=$(( -offset ))
+    fi
+    # Dias desde 1970-01-01 (algoritmo days_from_civil de H. Hinnant)
+    local yy=$y era yoe doy doe mp
+    [[ "$m" -le 2 ]] && yy=$((y - 1))
+    era=$(( yy / 400 ))
+    yoe=$(( yy - era * 400 ))
+    if [[ "$m" -gt 2 ]]; then mp=$((m - 3)); else mp=$((m + 9)); fi
+    doy=$(( (153 * mp + 2) / 5 + d - 1 ))
+    doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+    printf '%s\n' $(( (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mi * 60 + ss - offset ))
+}
+
+# Epoch de un disabled_at guardado: numerico (actual) o ISO 8601 (legacy).
+# Devuelve 1 si no se puede interpretar.
+epoch_of() {
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        parse_uint "$1" 0 9999999999
+    else
+        iso_to_epoch "$1"
+    fi
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 # shellcheck disable=SC2034  # la usan toggle-proxy.sh y los tests
 HAYAHORA_ACTIVE_JQ='.data[]
