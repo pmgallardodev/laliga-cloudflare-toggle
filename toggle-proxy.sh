@@ -32,7 +32,6 @@ fi
 
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/toggle-proxy.log}"
 STATE_FILE="${STATE_FILE:-${SCRIPT_DIR}/state/proxy_disabled.json}"
-LOCK_FILE="${SCRIPT_DIR}/state/toggle-proxy.lock"
 DRY_RUN="${DRY_RUN:-false}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -202,11 +201,16 @@ is_protected_domain() {
 }
 
 
-# Escritura atomica: escribe a tmp y luego mv (previene corrupcion por crash)
+# Escritura atomica: temporal unico en el mismo directorio y mv (rename
+# atomico). Dos procesos nunca comparten el mismo .tmp.
 atomic_write() {
-    local file="$1"
-    local content="$2"
-    echo "$content" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    local file="$1" content="$2" tmp
+    tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || return 1
+    if printf '%s\n' "$content" > "$tmp" && mv -f "$tmp" "$file"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # Leer state file de forma segura (devuelve [] si no existe o esta corrupto)
@@ -245,24 +249,47 @@ state_remove() { # <id>
     state_update 'map(select(.record_id != $id))' --arg id "$1"
 }
 
-cleanup() {
-    rm -f "$LOCK_FILE"
+# --- Lock (prevenir ejecucion concurrente) ------------------------------------
+# mkdir es atomico: solo un proceso crea el directorio. Dentro va el PID.
+# Un lock se considera huerfano solo si su PID ya no existe o si tiene mas
+# de 30 minutos (PID reutilizado por otro proceso). Va junto al state.
+LOCK_DIR="$(dirname "$STATE_FILE")/toggle-proxy.lock.d"
+LOCK_STALE_MINUTES=30
+
+take_lock() {
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    echo $$ > "${LOCK_DIR}/pid"
 }
 
-# --- Lock file (prevenir ejecucion concurrente) -----------------------------
+cleanup() {
+    if [[ "$(cat "${LOCK_DIR}/pid" 2>/dev/null)" == "$$" ]]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
 
-if [[ -f "$LOCK_FILE" ]]; then
-    lock_pid="$(cat "$LOCK_FILE" 2>/dev/null || echo "")"
-    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-        log "WARN" "Otra instancia en ejecucion (PID $lock_pid). Saliendo."
+if ! take_lock; then
+    lock_pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || echo "")"
+    stale_reason=""
+    if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        stale_reason="PID $lock_pid ya no existe"
+    elif [[ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]]; then
+        stale_reason="tiene mas de $LOCK_STALE_MINUTES minutos"
+    fi
+    if [[ -z "$stale_reason" ]]; then
+        log "WARN" "Otra instancia en ejecucion (PID ${lock_pid:-?}). Saliendo."
         exit 0
-    else
-        log "WARN" "Lock file huerfano encontrado (PID $lock_pid ya no existe). Limpiando."
-        rm -f "$LOCK_FILE"
+    fi
+    log "WARN" "Lock huerfano encontrado ($stale_reason). Limpiando."
+    # Romperlo con un rename: si dos procesos lo intentan, solo uno lo mueve
+    stale_dir="${LOCK_DIR}.stale.$$"
+    if mv "$LOCK_DIR" "$stale_dir" 2>/dev/null; then
+        rm -rf "$stale_dir"
+    fi
+    if ! take_lock; then
+        log "WARN" "Otra instancia tomo el lock a la vez. Saliendo."
+        exit 0
     fi
 fi
-
-echo $$ > "$LOCK_FILE"
 trap cleanup EXIT
 
 # --- Verificar dependencias -------------------------------------------------

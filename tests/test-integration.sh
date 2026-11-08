@@ -686,6 +686,57 @@ t_outbox_dry_run_untouched() {
     ok "DRY_RUN no envia ni toca la bandeja" '[[ $(tg_count) == 0 && $(outbox_len) == 1 ]]'
 }
 
+# --- T20: lock atomico y escritura atomica unica ---------------------------------------
+
+lock_dir() { echo "${APP}/state/toggle-proxy.lock.d"; }
+
+t_lock_live_pid_fresh_blocks() {
+    setup lock-live
+    mkdir "$(lock_dir)"
+    echo $$ > "$(lock_dir)/pid"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "lock reciente con PID vivo: sale sin tocar nada" '[[ $RC == 0 && $(api_calls) == 0 ]] && out_has "Otra instancia"'
+    ok "y no borra el lock ajeno" '[[ -f "$(lock_dir)/pid" ]]'
+}
+
+t_lock_old_is_stale() {
+    setup lock-old
+    mkdir "$(lock_dir)"
+    echo $$ > "$(lock_dir)/pid"
+    touch -t 202001010000 "$(lock_dir)/pid" "$(lock_dir)"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "lock de mas de 30 min con PID vivo (reutilizado): se rompe" '[[ $(patches r1) == 1 ]] && out_has "huerfano"'
+    ok "el lock se libera al terminar" '[[ ! -e "$(lock_dir)" ]]'
+}
+
+t_lock_dead_pid_is_stale() {
+    setup lock-dead
+    mkdir "$(lock_dir)"
+    echo 999999 > "$(lock_dir)/pid"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "lock con PID muerto: se rompe" '[[ $(patches r1) == 1 ]]'
+}
+
+t_lock_custom_state_dir() {
+    setup lock-custom-state
+    rm -rf "${APP}/state"
+    feed 104.21.13.229:ISP
+    run_app STATE_FILE="${CASE_DIR}/custom/proxy_disabled.json"
+    ok "STATE_FILE en otro directorio: el lock va con el state" '[[ $RC == 0 && $(patches r1) == 1 && -f "${CASE_DIR}/custom/proxy_disabled.json" ]]'
+}
+
+t_atomic_write_unique_tmp() {
+    setup atomic-tmp
+    mkdir -p "${STATE}.tmp"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "un .tmp fijo bloqueado no impide guardar el state" '[[ $(state_ids) == r1 ]]'
+    ok "no quedan temporales" '[[ $(ls "${APP}/state" | grep -vc -e "^proxy_disabled" -e "^toggle-proxy" ) == 0 && -z "$(ls "${APP}/state" | grep -E "json\.[A-Za-z0-9]{6}$")" ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
