@@ -349,6 +349,59 @@ resolve_candidates() {
     done | sort -u
 }
 
+# Candidatas cuando el apex no da ninguna IP de Cloudflare (apex en gris o sin
+# A/AAAA): se resuelven los nombres con proxy de la zona dentro del dominio.
+# Coste acotado: como mucho MAX_CANDIDATE_HOSTS nombres (sin comodines) y 7
+# consultas por nombre (dig del sistema A y AAAA + Google con ECS de cada ISP
+# en A), es decir <= 70 consultas por dominio y solo en este caso.
+MAX_CANDIDATE_HOSTS=10
+resolve_child_candidates() {
+    local zone_id="$1" domain="$2" host sub
+    [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || return 0
+    cf_list_records "$zone_id" || return 0
+    # Sin "head": con pipefail un SIGPIPE de jq abortaria la ejecucion
+    printf '%s' "$ZONE_RECORDS" | jq -r --arg domain "$domain" --argjson max "$MAX_CANDIDATE_HOSTS" "${CANON_JQ}"'
+        [.[]
+         | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
+         | select(.proxied == true)
+         | .name | canon
+         | select(. == $domain or endswith("." + $domain))
+         | select(startswith("*") | not)
+        ] | unique | .[:$max][]' 2>/dev/null \
+    | while IFS= read -r host; do
+        {
+            dig_short "$host" A
+            dig_short "$host" AAAA
+            for sub in $ES_ECS_SUBNETS; do
+                dig_short "@${ECS_RESOLVER}" "+subnet=${sub}" "$host" A
+            done
+        } | while IFS= read -r ip; do
+            if [[ -n "$ip" ]] && is_cloudflare_ip "$ip"; then echo "$ip"; fi
+        done
+    done | sort -u
+}
+
+# Avisos de mitigacion parcial de un dominio (lee la lista de la zona):
+#   - CNAME con proxy cuyo destino esta fuera del dominio: si el destino
+#     tiene proxy en Cloudflare, el trafico sigue pasando por Cloudflare
+#   - registro read-only con proxy: ese nombre sigue pasando por Cloudflare
+# Imprime "nombre<TAB>aviso" por linea.
+partial_mitigation_warnings() {
+    local domain="$1" records_json="$2"
+    printf '%s' "$records_json" | jq -r --arg domain "$domain" "${CANON_JQ}"'
+        def inscope: . == $domain or endswith("." + $domain);
+        .[]
+        | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
+        | select(.proxied == true)
+        | .name |= canon
+        | select(.name | inscope)
+        | if (.meta.read_only // false) == true then
+            "\(.name)\t\(.type) \(.name) es de solo lectura y sigue con proxy: ese nombre sigue pasando por Cloudflare"
+          elif .type == "CNAME" and ((.content // "") | canon | inscope | not) then
+            "\(.name)\tCNAME \(.name) -> \(.content | canon) apunta fuera de \($domain): si el destino tiene proxy, el trafico sigue pasando por Cloudflare"
+          else empty end' 2>/dev/null || true
+}
+
 # Numero de registros en el state file que pertenecen al dominio
 domain_state_count() {
     read_state | jq --arg zid "$1" --arg d "$2" "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))] | length'
@@ -586,6 +639,8 @@ reapplied_names=""
 disable_reasons=""
 restored_lines=""
 total_restored=0
+partial_warnings=""
+domain_partial=""
 restore_pending_lines=""
 enable_reasons=""
 
@@ -625,6 +680,14 @@ disable_domain() {
     ')"
 
     record_count="$(echo "$target_records" | jq 'length')"
+
+    local w_name w_text
+    while IFS=$'\t' read -r w_name w_text; do
+        [[ -n "$w_name" ]] || continue
+        is_protected_domain "$w_name" && continue
+        log "WARN" "  [PARCIAL] $w_text"
+        domain_partial="${domain_partial}  - ${w_text}"$'\n'
+    done < <(partial_mitigation_warnings "$domain" "$records_json")
 
     if [[ "$record_count" -eq 0 ]]; then
         log "INFO" "  No hay registros proxied para $domain."
@@ -857,6 +920,12 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
     else
         candidates="$(resolve_candidates "$domain")"
         if [[ -z "$candidates" ]]; then
+            log "INFO" "  El apex de $domain no da IPs de Cloudflare. Probando sus subdominios con proxy."
+            # Listar aqui (no en la subshell) para que disable_domain reutilice la cache
+            if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then cf_list_records "$zone_id" || any_error=true; fi
+            candidates="$(resolve_child_candidates "$zone_id" "$domain")"
+        fi
+        if [[ -z "$candidates" ]]; then
             log "WARN" "  Ninguna IP resuelta de $domain es de Cloudflare. El proxy podria estar desactivado manualmente. Sin accion."
             continue
         fi
@@ -960,7 +1029,11 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
             save_ips_for "$domain" "$(echo "$candidates" | jq -R . | jq -sc .)"
         fi
         disabled_before="$total_disabled"
+        domain_partial=""
         disable_domain "$zone_id" "$domain"
+        if [[ "$total_disabled" -gt "$disabled_before" && -n "$domain_partial" ]]; then
+            partial_warnings="${partial_warnings}${domain_partial}"
+        fi
         # Motivo solo si esta ejecucion ha deshabilitado algo de este dominio:
         # un bloqueo que sigue activo no vuelve a alertar
         if [[ "$total_disabled" -gt "$disabled_before" && "$domain_reason_added" == "false" ]]; then
@@ -1036,10 +1109,13 @@ if [[ "$total_disabled" -gt 0 ]]; then
 
 LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $total_disabled registro(s) nuevo(s), $final_count en total:
 
-<code>$(html_escape "$(truncate_text "$new_disabled_lines" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
+<code>$(html_escape "$(truncate_text "$new_disabled_lines" $(( (TELEGRAM_TEXT_BUDGET - 500) / 2 )))")</code>
 
 Motivo:
-$(html_escape "$(truncate_text "$disable_reasons" $((TELEGRAM_TEXT_BUDGET / 2)))")
+$(html_escape "$(truncate_text "$disable_reasons" $(( (TELEGRAM_TEXT_BUDGET - 500) / 2 )))")${partial_warnings:+
+
+⚠️ Mitigacion parcial:
+$(html_escape "$(truncate_text "$partial_warnings" 500)")}
 EOF
 )"
 fi

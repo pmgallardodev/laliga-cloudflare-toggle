@@ -562,6 +562,59 @@ t_restore_missing_record_resolved() {
     ok "el resto se restaura y se alerta" '[[ $(proxied_of r1) == true ]] && tg_texts | grep -q REHABILITADO'
 }
 
+# --- T17: candidatas desde subdominios con proxy ----------------------------------------
+
+t_grey_apex_proxied_child() {
+    setup grey-apex-proxied-child
+    records "[$(rec r1 example.test false),$(rec r2 www.example.test true),$(rec r3 '*.example.test' true)]"
+    dns example.test A 203.0.113.20
+    dns www.example.test A 104.21.13.225
+    feed 104.21.13.229:ISP
+    run_app
+    ok "apex gris: se resuelven los subdominios con proxy y se deshabilita www" '[[ $(patches r2) == 1 && $(proxied_of r2) == false ]]'
+    ok "consultas acotadas por subdominio (<= 7)" '[[ $(grep -c " www.example.test " "${HDATA}/dig.log") -le 7 ]]'
+    ok "la zona se lista una sola vez" '[[ $(grep -c "dns_records?per_page=100" "${HDATA}/calls.log") == 1 ]]'
+    ok "el comodin no se resuelve" '! grep -q "\*.example.test" "${HDATA}/dig.log"'
+}
+
+t_child_candidates_bounded() {
+    setup child-candidates-bounded
+    local i recs
+    recs="$(rec r0 example.test false)"
+    for i in $(seq 1 15); do recs="${recs},$(rec "r$i" "h$i.example.test" true)"; dns "h$i.example.test" A 104.21.13.225; done
+    records "[$recs]"
+    dns example.test A 203.0.113.20
+    run_app
+    ok "15 subdominios: solo se resuelven 10, sin abortar" '[[ $RC == 0 && $(cut -d" " -f2 "${HDATA}/dig.log" | grep -c "^h") -le 70 && $(cut -d" " -f2 "${HDATA}/dig.log" | grep "^h" | sort -u | wc -l | xargs) == 10 ]]'
+}
+
+# --- T18: avisos de mitigacion parcial ----------------------------------------------------
+
+t_partial_mitigation_cname_other_zone() {
+    setup cname-other-zone
+    records "[$(rec r1 example.test true CNAME origin.other.test),$(rec r2 www.example.test true CNAME example.test)]"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "CNAME fuera del dominio avisado en la alerta" 'tg_texts | grep -q "parcial" && tg_texts | grep -q "origin.other.test"'
+    ok "CNAME dentro del dominio sin aviso" '! tg_texts | grep -q "www.example.test -&gt; example.test"'
+    ok "aviso tambien en el log" 'out_has "WARN.*origin.other.test"'
+}
+
+t_partial_mitigation_read_only_same_name() {
+    setup read-only-same-name
+    records "[$(rec r1 example.test true),$(rec r2 example.test true AAAA 100:: '{"read_only":true}')]"
+    feed 104.21.13.229:ISP
+    run_app
+    ok "registro read-only con proxy en el mismo nombre avisado" 'tg_texts | grep -q "parcial" && tg_texts | grep -q "AAAA example.test"'
+}
+
+t_no_partial_warning_when_complete() {
+    setup no-partial-warning
+    feed 104.21.13.229:ISP
+    run_app
+    ok "sin avisos si la mitigacion es completa" 'tg_texts | grep -q DESHABILITADO && ! tg_texts | grep -q "parcial"'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

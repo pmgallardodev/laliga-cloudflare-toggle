@@ -61,8 +61,8 @@ The user authorized fixing all findings, then commit and push of this branch (20
 - [x] T14: pagination of dns_records.
 - [x] T15: hysteresis. A feed outage resets the clear timer (only consecutive healthy, clear checks count).
 - [x] T16: per-record restore accounting and alerts (a partial restore is alerted).
-- [ ] T17: candidate discovery covers proxied subdomains when the apex has no Cloudflare IPs (bounded).
-- [ ] T18: partial mitigation warnings. A CNAME to another zone, or a same-name read-only proxied record,
+- [x] T17: candidate discovery covers proxied subdomains when the apex has no Cloudflare IPs (bounded).
+- [x] T18: partial mitigation warnings. A CNAME to another zone, or a same-name read-only proxied record,
       is reported in the alert.
 - [ ] T19: notification outbox. Failed or 429 alerts persist and are retried with deduplication.
 - [ ] T20: atomic lock (`mkdir` or `flock`) and a unique tmp file for `atomic_write`.
@@ -133,3 +133,5 @@ change). Each entry lists the commit and the observed checks.
 - T14 `<T14>` fix(cloudflare): `cf_list_records` follows `result_info.total_pages` (page 1 is `?per_page=100`, then `&page=N`, cap 50 pages, any page failure fails the listing), cached per domain iteration. RED: 3 fails (only 100 of 101 PATCHed, page 2 never requested). GREEN: integration 95/0 on both shells, unit 202/0, scratch harness 23/0, shellcheck clean.
 - T15 `<T15>` (with T16) fix(restore): on the feed-down path the clear mark of each domain with state is deleted (not in DRY_RUN), so only consecutive healthy clear checks count. RED: 3 fails (restored on the first run after a 55-minute outage). GREEN: integration 106/0 both shells. Scratch harness: 22/1, the failing check `run8 hayahora caida no toca clear` asserts the pre-T15 behaviour and is now obsolete by design.
 - T16 `<T15>` each restored (or already proxied) record is counted and listed as it completes; the REHABILITADO alert adds a "Restauracion parcial" section with the records still grey; a GET 404/81044 logs "ya no existe ... Se da por resuelto" and drops the entry. RED: partial restore sent no alert; a deleted record blocked the domain forever. GREEN as above.
+- T17 `<T17>` (with T18) feat(detect): when the apex yields no Cloudflare IP, `resolve_child_candidates` resolves the zone's proxied hostnames in scope (no wildcards, at most 10, 7 dig queries each: system A/AAAA plus ECS A per ISP, so <= 70 queries, only in this case); the listing is cached for disable_domain. RED: grey apex with blocked proxied www -> no Cloudflare call, no PATCH. GREEN: integration 116/0 both shells; scratch harness 22/1 (obsolete run8 check, see T15).
+- T18 `<T17>` `partial_mitigation_warnings`: proxied CNAME whose target is outside the managed domain, and read-only proxied records in scope; logged as WARN [PARCIAL] and added to the DISABLED alert under "Mitigacion parcial" (only for domains with new disables; protected names skipped). RED: 3 fails (no warning). GREEN as above.
