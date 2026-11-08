@@ -37,6 +37,39 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
       stay clear in consecutive checks before it is restored. A new block resets the clear timer.
 - [x] T5: document the new options in `README.md` and `.env.example`.
 
+### Round 2: Codex review findings (gpt-6.1-sol, report `/private/tmp/laliga-audit.2WjVm2/REPORT.md`)
+
+The user authorized fixing all findings, then commit and push of this branch (2026-11-08).
+
+- [ ] T6: validate the feed. Require an HTTP 2xx, a non-empty body, `.data` as an array, string `ip`/`isp`,
+      a nullable `description`, and `stateChanges` as an array of objects. Any invalid response follows the
+      unavailable-feed timeout path, and no jq call can crash the run.
+- [ ] T7: CIDR correctness. Do exact numeric membership for every published Cloudflare IPv4/IPv6 range,
+      with boundary tests.
+- [ ] T8: numeric env parsing. Base 10 with bounds for `MIN_CLEAR_MINUTES`, `MAX_DISABLED_HOURS`,
+      `CHECK_INTERVAL` and persisted epochs (`08` must work).
+- [ ] T9: timestamps. Parse legacy ISO `...Z` disabled_at as UTC on GNU, BusyBox and BSD; an unparseable
+      value must not wait forever.
+- [ ] T10: name handling. Comparisons are case-insensitive and ignore a trailing dot (protected domains,
+      scope, state keys).
+- [ ] T11: restore PATCH sends only `{"proxied": true}` (and disable only `{"proxied": false}`), so a
+      rename is never reverted.
+- [ ] T12: write-ahead state. Record the intent before the PATCH and reconcile the real record state on the
+      next run (ambiguous PATCH, crash, or log failure). A log write failure must not abort bookkeeping.
+- [ ] T13: corrupt state. Quarantine the file, log ERROR and alert; never treat it as `[]` and never delete
+      the support files.
+- [ ] T14: pagination of dns_records.
+- [ ] T15: hysteresis. A feed outage resets the clear timer (only consecutive healthy, clear checks count).
+- [ ] T16: per-record restore accounting and alerts (a partial restore is alerted).
+- [ ] T17: candidate discovery covers proxied subdomains when the apex has no Cloudflare IPs (bounded).
+- [ ] T18: partial mitigation warnings. A CNAME to another zone, or a same-name read-only proxied record,
+      is reported in the alert.
+- [ ] T19: notification outbox. Failed or 429 alerts persist and are retried with deduplication.
+- [ ] T20: atomic lock (`mkdir` or `flock`) and a unique tmp file for `atomic_write`.
+- [ ] T21: PID 1 signals. Trap TERM/INT in entrypoint.sh, wait for the child, then exit.
+- [ ] T22: bounded log (size-based rotation).
+- [ ] T23: integration tests in the repo (stub curl/dig) that cover the scenarios above; update the docs.
+
 ## Acceptance criteria
 
 - Pure helpers (truncation, reason summary, restore decision) have tests in
@@ -81,3 +114,11 @@ Next step: parent review of the branch; push and PR remain the user's decision.
   hysteresis section, read-only records, new failure rows, clear file, new alert format.
   `.env.example`: `MIN_CLEAR_MINUTES=15`. Passive docs: structural readback only (no RED/GREEN);
   tests 50 ok / 0 fallos, shellcheck only the 2 pre-existing warnings, `bash -n` ok.
+
+Round 2 (delegated writer, one bounded writer; route: delegated direct because 2+ non-trivial files
+change). Each entry lists the commit and the observed checks.
+
+- T23 part 1 (harness): `tests/test-integration.sh` with stub `curl`, `dig` and `date` in
+  `tests/integration/bin`, and `tests/run-all.sh` (bash 5 and `/bin/bash` 3.2). Covers T1-T4 with the
+  current code: 20 ok / 0 fallos on both shells (GREEN by design; it pins existing behaviour). Also
+  silences the 2 pre-existing shellcheck warnings with directives (SC1090 `.env`, SC2034).

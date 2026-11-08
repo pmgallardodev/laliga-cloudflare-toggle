@@ -217,6 +217,7 @@ restore_due() {
 }
 
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
+# shellcheck disable=SC2034  # la usan toggle-proxy.sh y los tests
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)
     | select(.stateChanges[-1].state == true)

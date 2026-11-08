@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# date falso: "date +%s" devuelve $HDATA/now si existe; el resto, date real.
+if [[ "$*" == "+%s" && -f "$HDATA/now" ]]; then
+    cat "$HDATA/now"
+else
+    exec /bin/date "$@"
+fi

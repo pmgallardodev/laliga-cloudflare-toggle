@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# dig falso: responde con $HDATA/dns/<nombre>.<TIPO> (una IP por linea).
+# Ignora @resolver y +opciones; anota cada consulta en dig.log.
+dom="" type=A
+for a in "$@"; do
+    case "$a" in
+        @*|+*) ;;
+        A|AAAA|CNAME) type="$a" ;;
+        *) dom="$a" ;;
+    esac
+done
+printf '%s %s %s\n' "$type" "$dom" "$*" >> "$HDATA/dig.log"
+cat "$HDATA/dns/${dom}.${type}" 2>/dev/null
+exit 0

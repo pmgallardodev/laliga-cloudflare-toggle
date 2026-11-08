@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# curl falso para los tests de integracion. Nunca sale a la red: atiende
+# hayahora, Telegram y la API de Cloudflare con ficheros de $HDATA.
+#   feed.json / feed_code / feed_rc       respuesta del feed
+#   records.json                          registros DNS ([{id,name,...,zone?}])
+#   fail_ids                              ids cuyo PATCH falla con 400/1043
+#   patch_ambiguous                       el PATCH se aplica pero curl sale 28
+#   tg_responses (una por linea) o tg_response.json   respuestas de Telegram
+# Cada llamada se anota en calls.log como "METODO URL DATOS".
+set -u
+method=GET data="" url="" wfmt="" fail=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -X) method="$2"; shift 2 ;;
+        -d|--data|--data-binary) data="$2"; [[ "$method" == GET ]] && method=POST; shift 2 ;;
+        -w) wfmt="$2"; shift 2 ;;
+        -H|--max-time|-m|-o) shift 2 ;;
+        -f|--fail) fail=true; shift ;;
+        -sf|-fs|-sSf|-fsS) fail=true; shift ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+printf '%s %s %s\n' "$method" "$url" "$(printf '%s' "$data" | tr -d '\n')" >> "$HDATA/calls.log"
+
+finish() { # finish <code> <cuerpo>
+    printf '%s' "$2"
+    [[ -n "$wfmt" ]] && printf '\n%s' "$1"
+    exit 0
+}
+
+case "$url" in
+    *hayahora*)
+        code="$(cat "$HDATA/feed_code" 2>/dev/null || echo 200)"
+        rc="$(cat "$HDATA/feed_rc" 2>/dev/null || echo 0)"
+        [[ "$rc" != 0 ]] && exit "$rc"
+        if [[ "$fail" == true && "$code" -ge 400 ]]; then exit 22; fi
+        cat "$HDATA/feed.json" 2>/dev/null
+        exit 0 ;;
+    *api.telegram.org*)
+        printf '%s\n' "$data" >> "$HDATA/telegram.log"
+        if [[ -s "$HDATA/tg_responses" ]]; then
+            head -1 "$HDATA/tg_responses"
+            sed '1d' "$HDATA/tg_responses" > "$HDATA/tg_responses.x" && mv "$HDATA/tg_responses.x" "$HDATA/tg_responses"
+        elif [[ -f "$HDATA/tg_response.json" ]]; then
+            cat "$HDATA/tg_response.json"
+        else
+            echo '{"ok":true,"result":{}}'
+        fi
+        exit 0 ;;
+    *api.cloudflare.com/client/v4/zones/*)
+        rest="${url#*/zones/}"
+        zone="${rest%%/*}"
+        recs="$HDATA/records.json"
+        if [[ "$url" == *"/dns_records?"* ]]; then
+            page=1 per=100 q="${url#*\?}"
+            [[ "$q" =~ (^|&)page=([0-9]+) ]] && page="${BASH_REMATCH[2]}"
+            [[ "$q" =~ (^|&)per_page=([0-9]+) ]] && per="${BASH_REMATCH[2]}"
+            body="$(jq -c --arg z "$zone" --argjson page "$page" --argjson per "$per" '
+                [.[] | select((.zone // $z) == $z)] as $all
+                | ($all | length) as $n
+                | {success: true,
+                   result: $all[(($page - 1) * $per):($page * $per)],
+                   result_info: {page: $page, per_page: $per, total_count: $n,
+                                 total_pages: ((($n + $per - 1) / $per) | floor)}}' "$recs")"
+            finish 200 "$body"
+        fi
+        id="${url##*/}"
+        rec="$(jq -c --arg z "$zone" --arg id "$id" '.[] | select(.id == $id and (.zone // $z) == $z)' "$recs")"
+        if [[ -z "$rec" ]]; then
+            finish 404 '{"success":false,"errors":[{"code":81044,"message":"Record does not exist."}],"result":null}'
+        fi
+        if [[ "$method" == PATCH ]]; then
+            if [[ "$(jq -r '.meta.read_only // false' <<< "$rec")" == true ]] \
+                || grep -qx "$id" "$HDATA/fail_ids" 2>/dev/null; then
+                finish 400 '{"success":false,"errors":[{"code":1043,"message":"simulated refusal"}]}'
+            fi
+            jq --arg id "$id" --argjson d "$data" 'map(if .id == $id then . + $d else . end)' "$recs" \
+                > "$recs.x" && mv "$recs.x" "$recs"
+            if [[ -f "$HDATA/patch_ambiguous" ]]; then
+                [[ -n "$wfmt" ]] && printf '\n000'
+                exit 28
+            fi
+        fi
+        finish 200 "$(jq -c --arg id "$id" '{success: true, result: (.[] | select(.id == $id))}' "$recs")" ;;
+    *)
+        echo "stub curl: URL inesperada: $url" >&2
+        exit 99 ;;
+esac
