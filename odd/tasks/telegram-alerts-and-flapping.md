@@ -52,6 +52,8 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
 
 (updated per task with commit ids)
 
+Next step: parent review of the branch; push and PR remain the user's decision.
+
 - T1 (delegated writer) `f72e20f` fix(cloudflare): skip read-only records and log API errors.
   Checks: tests 27 ok / 0 fallos; shellcheck only the 2 pre-existing warnings (SC1090, SC2034);
   `bash -n` ok. Stub harness: read-only AAAA never PATCHed (RED on base, GREEN after); HTTP 400
@@ -75,7 +77,7 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
   `MIN_CLEAR_MINUTES=15` does not restore; a 20-minute-old mark restores; `0` restores at once;
   DRY_RUN writes no mark; a down feed leaves marks untouched and keeps the timeout path.
   shellcheck: only the 2 pre-existing warnings; `bash -n` ok.
-- T5 (delegated writer) docs commit, hash recorded in the follow-up progress commit. README:
+- T5 (delegated writer) `508e985` docs: document MIN_CLEAR_MINUTES, alert format and read-only records. README:
   hysteresis section, read-only records, new failure rows, clear file, new alert format.
   `.env.example`: `MIN_CLEAR_MINUTES=15`. Passive docs: structural readback only (no RED/GREEN);
   tests 50 ok / 0 fallos, shellcheck only the 2 pre-existing warnings, `bash -n` ok.
