@@ -118,6 +118,26 @@ check "truncate_text: multibyte sigue siendo UTF-8 valido" "ok" \
     "$(printf '%s' "$cut_multi" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && echo ok || echo roto)"
 check "truncate_text: multibyte intacto si cabe" "$(printf '→🙂ñ')" "$(truncate_text "$(printf '→🙂ñ')" 3)"
 
+# --- summarize_matches: motivo resumido por dominio ---
+five="$(printf '%s\t%s\t%s\t%s\n' \
+    DIGI 188.114.96.5 same24 188.114.96.2 \
+    Movistar 188.114.97.5 exact 188.114.97.5 \
+    Orange 188.114.96.7 same24 188.114.96.2 \
+    Vodafone 188.114.96.8 same24 188.114.96.2 \
+    Masmovil 188.114.96.9 same24 188.114.96.2)"
+check "summarize_matches: corta en max y anade +N mas" \
+    "5 coincidencias: DIGI 188.114.96.5 (same24), Movistar 188.114.97.5 (exact), Orange 188.114.96.7 (same24) +2 mas" \
+    "$(summarize_matches 3 <<< "$five")"
+check "summarize_matches: justo max sin +N mas" \
+    "3 coincidencias: DIGI 188.114.96.5 (same24), Movistar 188.114.97.5 (exact), Orange 188.114.96.7 (same24)" \
+    "$(head -3 <<< "$five" | summarize_matches 3)"
+check "summarize_matches: una coincidencia en singular" \
+    "1 coincidencia: DIGI 188.114.96.5 (same24)" "$(head -1 <<< "$five" | summarize_matches 3)"
+check "summarize_matches: entrada vacia" "" "$(summarize_matches 3 < /dev/null)"
+check "summarize_matches: ignora lineas vacias" \
+    "1 coincidencia: DIGI 188.114.96.5 (same24)" "$(printf '\n%s\n\n' "$(head -1 <<< "$five")" | summarize_matches 3)"
+check "summarize_matches: max 0 solo cuenta" "5 coincidencias: +5 mas" "$(summarize_matches 0 <<< "$five")"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]

@@ -373,6 +373,8 @@ fi
 
 any_error=false
 total_disabled=0
+# Registros deshabilitados en ESTA ejecucion (la alerta solo lleva estos)
+new_disabled_lines=""
 total_reapplied=0
 reapplied_names=""
 disable_reasons=""
@@ -462,6 +464,7 @@ disable_domain() {
         if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
             log "INFO" "  [OK] Proxy deshabilitado: $record_type $record_name -> $record_content"
             total_disabled=$((total_disabled + 1))
+            new_disabled_lines="${new_disabled_lines}  - ${record_type} ${record_name} → ${record_content}"$'\n'
 
             # Guardar en state file INMEDIATAMENTE tras cada PATCH exitoso
             new_state="$(jq \
@@ -609,10 +612,10 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
                     else
                         log "WARN" "  [$m_rule] $m_isp bloquea $m_ip (mismo bloque que nuestra $m_cand)"
                     fi
-                    [[ -n "$reason" ]] && reason="${reason}; "
-                    reason="${reason}${m_isp} bloqueando ${m_ip} (${m_rule})"
                     match_count=$((match_count + 1))
                 done <<< "$matches"
+                # Motivo acotado: total y como mucho 3 coincidencias por dominio
+                reason="$(summarize_matches 3 <<< "$matches")"
                 log "WARN" "  BLOQUEO DE $domain ($match_count entradas)"
             else
                 log "INFO" "  Nuestras IPs de $domain NO estan bloqueadas"
@@ -668,8 +671,13 @@ for idx in "${!DOMAIN_NAMES[@]}"; do
         if [[ "$legacy_check" == "false" ]]; then
             save_ips_for "$domain" "$(echo "$candidates" | jq -R . | jq -sc .)"
         fi
+        disabled_before="$total_disabled"
         disable_domain "$zone_id" "$domain"
-        disable_reasons="${disable_reasons}${domain}: ${reason}"$'\n'
+        # Motivo solo si esta ejecucion ha deshabilitado algo de este dominio:
+        # un bloqueo que sigue activo no vuelve a alertar
+        if [[ "$total_disabled" -gt "$disabled_before" ]]; then
+            disable_reasons="${disable_reasons}${domain}: ${reason}"$'\n'
+        fi
     elif [[ "$state_n" -gt 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             log "DRY_RUN" "  ACCION NECESARIA: bloqueo terminado. Se REHABILITARIA el proxy en $state_n registro(s) de $domain."
@@ -703,13 +711,12 @@ fi
 
 if [[ "$total_disabled" -gt 0 ]]; then
     log "INFO" "Total en state file: $final_count registro(s) ($total_disabled nuevos en esta ejecucion)"
-    records_list="$(jq -r '.[] | "  - \(.type) \(.name) → \(.content)"' "$STATE_FILE" 2>/dev/null)"
     notify_telegram "$(cat <<EOF
 🔴 <b>Proxy Cloudflare DESHABILITADO</b>
 
-LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $final_count registro(s):
+LaLiga ha activado bloqueos. Se ha quitado el proxy (nube naranja → gris) en $total_disabled registro(s) nuevo(s), $final_count en total:
 
-<code>$(html_escape "$(truncate_text "$records_list" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
+<code>$(html_escape "$(truncate_text "$new_disabled_lines" $((TELEGRAM_TEXT_BUDGET / 2)))")</code>
 
 Motivo:
 $(html_escape "$(truncate_text "$disable_reasons" $((TELEGRAM_TEXT_BUDGET / 2)))")

@@ -31,7 +31,7 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
       non-2xx responses.
 - [x] T2: make Telegram delivery checked and bounded. Truncate text to fit the 4096-character
       limit, and log `ERROR` when the API answers `ok != true`.
-- [ ] T3: alert only on newly disabled records, and summarize the reasons (a capped number of
+- [x] T3: alert only on newly disabled records, and summarize the reasons (a capped number of
       matches per domain, then "+N more").
 - [ ] T4: add a restore hysteresis. `MIN_CLEAR_MINUTES` (default 15) is how long a domain must
       stay clear in consecutive checks before it is restored. A new block resets the clear timer.
@@ -56,9 +56,15 @@ Make disable alerts reliable and stop the proxy from flapping during LaLiga bloc
   Checks: tests 27 ok / 0 fallos; shellcheck only the 2 pre-existing warnings (SC1090, SC2034);
   `bash -n` ok. Stub harness: read-only AAAA never PATCHed (RED on base, GREEN after); HTTP 400
   now logs `[{"code":1043,...}]`.
-- T2 (delegated writer) feat(telegram) commit, hash recorded in the T3 entry. `truncate_text`
+- T2 (delegated writer) `d35a04e` fix(telegram): bound message length and log rejected notifications. `truncate_text`
   (jq, counts Unicode characters) RED: `command not found`; GREEN: 36 ok / 0 fallos. Variable
   message parts are cut in raw form before `html_escape`, so no entity is ever split; budget
   3500 characters (half per part when there are two). `notify_telegram` logs `ERROR` with
   `.description` when `ok != true`; harness run with `ok:false` logged it and exited 0.
   shellcheck: only the 2 pre-existing warnings; `bash -n` ok.
+- T3 (delegated writer) fix(alerts) commit, hash recorded in the T4 entry. `summarize_matches`
+  RED: `command not found` (5 of 6 new checks failed); GREEN: 42 ok / 0 fallos. DISABLED alert
+  lists only records disabled in this run plus the state total; a reason is added only for
+  domains with a new disable. Harness: a second blocked domain alerts only itself, a still-blocked
+  run sends no DISABLED alert, 150 matches summarize to "+147 mas". shellcheck: only the 2
+  pre-existing warnings; `bash -n` ok.

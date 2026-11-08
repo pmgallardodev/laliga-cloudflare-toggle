@@ -182,6 +182,29 @@ truncate_text() {
         end'
 }
 
+# Resumir las coincidencias de un dominio para el motivo de la alerta.
+#   summarize_matches <max> < lineas "isp<TAB>ip<TAB>regla<TAB>candidata"
+# Imprime "N coincidencias: ISP ip (regla), ... +M mas" con como mucho <max>
+# coincidencias detalladas. Sin coincidencias no imprime nada.
+summarize_matches() {
+    local max="$1" total=0 shown="" isp ip rule _cand
+    while IFS=$'\t' read -r isp ip rule _cand; do
+        [[ -n "$ip" ]] || continue
+        total=$((total + 1))
+        if [[ "$total" -le "$max" ]]; then
+            [[ -n "$shown" ]] && shown="${shown}, "
+            shown="${shown}${isp} ${ip} (${rule})"
+        fi
+    done
+    [[ "$total" -gt 0 ]] || return 0
+
+    local out="${total} coincidencias:"
+    [[ "$total" -eq 1 ]] && out="1 coincidencia:"
+    [[ -n "$shown" ]] && out="${out} ${shown}"
+    [[ "$total" -gt "$max" ]] && out="${out} +$((total - max)) mas"
+    printf '%s\n' "$out"
+}
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 HAYAHORA_ACTIVE_JQ='.data[]
     | select((.stateChanges | length) > 0)
