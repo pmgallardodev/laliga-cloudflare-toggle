@@ -266,6 +266,12 @@ check "epoch_of: ISO" "1794052800" "$(eo 2026-11-07T12:00:00Z)"
 check "epoch_of: null" "invalid" "$(eo null)"
 check "epoch_of: vacio" "invalid" "$(eo '')"
 
+# --- canon_name: nombres DNS canonicos (T10) ---
+check "canon_name: minusculas y sin punto final" "example.test" "$(canon_name "EXAMPLE.Test.")"
+check "canon_name: ya canonico" "www.example.test" "$(canon_name www.example.test)"
+check "canon_name: recorta espacios" "example.test" "$(canon_name "  Example.test ")"
+check "canon_name: vacio" "" "$(canon_name "")"
+
 echo
 echo "Resultado: $pass ok, $fail fallos"
 [[ "$fail" -eq 0 ]]

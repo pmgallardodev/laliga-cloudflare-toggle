@@ -330,6 +330,50 @@ t_timeout_uses_oldest_entry() {
     ok "el timeout cuenta desde la entrada mas antigua" '[[ $(patches r1) == 1 && $(patches r2) == 1 ]]'
 }
 
+# --- T10: nombres canonicos ----------------------------------------------------------
+
+t_names_protected_case_insensitive() {
+    setup protected-case
+    feed 104.21.13.229:ISP
+    run_app PROTECTED_DOMAINS="EXAMPLE.TEST."
+    ok "PROTECTED_DOMAINS ignora mayusculas y punto final" '[[ $(patches r1) == 0 ]] && out_has PROTEGIDO'
+}
+
+t_names_domains_and_records_canonical() {
+    setup names-canonical
+    records "[$(rec r1 example.test true),$(rec r2 WWW.Example.Test. true)]"
+    feed 104.21.13.229:ISP
+    run_app DOMAINS="Z:Example.TEST."
+    ok "DOMAINS y nombres de registro sin distinguir mayusculas" '[[ $(patches r1) == 1 && $(patches r2) == 1 ]]'
+    ok "state con dominio y nombres canonicos" '[[ $(jq -r "[.[] | .domain, .name] | unique | join(\",\")" "$STATE") == example.test,www.example.test ]]'
+    ok "IPs guardadas con clave canonica" '[[ $(jq -r "keys | join(\",\")" "$IPS") == example.test ]]'
+}
+
+t_names_legacy_state_mixed_case() {
+    setup names-legacy-case
+    records "[$(rec r1 example.test false)]"
+    printf '[%s]\n' "$(st r1 Example.Test 1999990000 EXAMPLE.test)" > "$STATE"
+    echo '{"Example.Test.":["104.21.13.225"]}' > "$IPS"
+    run_app MIN_CLEAR_MINUTES=0
+    ok "state e IPs legacy con mayusculas se reconocen" 'out_has "Usando IPs de Cloudflare guardadas" && [[ $(patches r1) == 1 ]]'
+}
+
+# --- T11: el PATCH solo cambia proxied -------------------------------------------------
+
+t_patch_body_only_proxied() {
+    setup patch-body
+    feed 104.21.13.229:ISP
+    run_app
+    ok "PATCH de deshabilitar solo lleva proxied" '[[ "$(patch_bodies)" == "{\"proxied\":false}" ]]'
+    setup rename-not-reverted
+    records "[$(rec r1 new.example.test false)]"
+    printf '[%s]\n' "$(st r1 old.example.test)" > "$STATE"
+    echo '{"example.test":["104.21.13.225"]}' > "$IPS"
+    run_app MIN_CLEAR_MINUTES=0
+    ok "PATCH de restaurar solo lleva proxied" '[[ "$(patch_bodies)" == "{\"proxied\":true}" ]]'
+    ok "un registro renombrado conserva su nombre nuevo" '[[ $(name_of r1) == new.example.test && $(proxied_of r1) == true ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do

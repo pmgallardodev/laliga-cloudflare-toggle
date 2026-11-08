@@ -50,9 +50,9 @@ The user authorized fixing all findings, then commit and push of this branch (20
       `CHECK_INTERVAL` and persisted epochs (`08` must work).
 - [x] T9: timestamps. Parse legacy ISO `...Z` disabled_at as UTC on GNU, BusyBox and BSD; an unparseable
       value must not wait forever.
-- [ ] T10: name handling. Comparisons are case-insensitive and ignore a trailing dot (protected domains,
+- [x] T10: name handling. Comparisons are case-insensitive and ignore a trailing dot (protected domains,
       scope, state keys).
-- [ ] T11: restore PATCH sends only `{"proxied": true}` (and disable only `{"proxied": false}`), so a
+- [x] T11: restore PATCH sends only `{"proxied": true}` (and disable only `{"proxied": false}`), so a
       rename is never reverted.
 - [ ] T12: write-ahead state. Record the intent before the PATCH and reconcile the real record state on the
       next run (ambiguous PATCH, crash, or log failure). A log write failure must not abort bookkeeping.
@@ -126,3 +126,5 @@ change). Each entry lists the commit and the observed checks.
 - T7 `<T7>` fix(cidr): exact numeric membership. RED: unit aborted (`CF_IPV4_RANGES: unbound variable`), integration `cidr-origin-not-cloudflare` failed (www PATCHed for a 108.162.1.x origin). GREEN: unit 169/0 (first/last/just-outside for all 15 v4 and 7 v6 ranges, 104.16/13 and 104.24/14 adjacency handled), integration 44/0, both shells. Single list `CF_IPV4_RANGES`/`CF_IPV6_RANGES`; `ipv4_parse`/`ipv6_parse` without subshells; `ipv6_prefix48` reuses `ipv6_parse`. shellcheck clean, scratch harness 23/0.
 - T8 `<T8>` (with T9) fix(config): `parse_uint` (base 10, <=15 digits, bounds). MIN_CLEAR_MINUTES 0-10080, MAX_DISABLED_HOURS 1-720 (invalid -> WARN and default); clear marks and numeric disabled_at go through it. RED: unit `command not found`; integration `minutes-08` 3 fails (bash 5 and 3.2), `max-hours-invalid` failed. GREEN: unit 198/0, integration 57/0 on both shells.
 - T9 `<T8>` pure-bash `iso_to_epoch` (days_from_civil, Z/offset/fraction, no `date` dependency, so GNU/BusyBox/BSD behave the same; BusyBox not run locally) and `epoch_of`. Timeout uses the oldest entry of the domain; an unreadable disabled_at logs ERROR and counts as expired. RED: TZ=Europe/Madrid restored at 11.5 h; garbage timestamp waited forever; oldest entry ignored. GREEN as above.
+- T10 `<T10>` (with T11) fix(names): `canon_name` and `CANON_JQ` (lowercase, trimmed, no trailing dot) for DOMAINS, PROTECTED_DOMAINS, record names, state matching and the keys of the ips/clear files (legacy keys migrate on read). RED: unit `command not found`; integration 5 fails (`PROTECTED_DOMAINS=EXAMPLE.TEST.` was PATCHed, mixed-case DOMAINS/records/legacy state not matched). GREEN: unit 202/0, integration 65/0 on both shells.
+- T11 `<T10>` PATCH bodies are the literals `{"proxied":false}` and `{"proxied":true}`; a renamed record logs WARN and keeps its new name. RED: 3 fails (full body sent, rename reverted). GREEN as above.

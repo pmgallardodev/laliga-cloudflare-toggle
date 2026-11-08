@@ -288,6 +288,20 @@ epoch_of() {
     fi
 }
 
+# Nombre DNS canonico para comparar: minusculas, sin espacios ni punto final.
+canon_name() {
+    local n
+    n="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    n="${n#"${n%%[![:space:]]*}"}"
+    n="${n%"${n##*[![:space:]]}"}"
+    while [[ "$n" == *. ]]; do n="${n%.}"; done
+    printf '%s\n' "$n"
+}
+
+# Lo mismo en jq, para anteponer a los filtros que comparan nombres
+# shellcheck disable=SC2034  # la usa toggle-proxy.sh
+CANON_JQ='def canon: ascii_downcase | gsub("^\\s+|\\s+$"; "") | sub("\\.+$"; "");'
+
 # Filtro jq: entradas de hayahora con bloqueo activo, como "ip<TAB>isp"
 # shellcheck disable=SC2034  # la usan toggle-proxy.sh y los tests
 HAYAHORA_ACTIVE_JQ='.data[]

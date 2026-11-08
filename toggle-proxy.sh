@@ -92,7 +92,8 @@ notify_telegram() {
 # Comprobar si un registro DNS pertenece a un dominio protegido
 # Devuelve 0 (true) si el nombre coincide con un dominio protegido o es subdominio de el
 is_protected_domain() {
-    local record_name="$1"
+    local record_name
+    record_name="$(canon_name "$1")"
     local all_protected="${PROTECTED_DOMAINS_BUILTIN}"
     if [[ -n "$PROTECTED_DOMAINS" ]]; then
         all_protected="${all_protected},${PROTECTED_DOMAINS}"
@@ -100,7 +101,7 @@ is_protected_domain() {
 
     IFS=',' read -ra prot_list <<< "$all_protected"
     for prot in "${prot_list[@]}"; do
-        prot="$(echo "$prot" | xargs)"
+        prot="$(canon_name "$prot")"
         [[ -z "$prot" ]] && continue
         if [[ "$record_name" == "$prot" || "$record_name" == *".${prot}" ]]; then
             return 0
@@ -236,10 +237,13 @@ CLEAR_FILE="${STATE_FILE%.json}_clear.json"
 
 # Filtro jq: registros del state que pertenecen a un dominio de DOMAINS.
 # Las entradas nuevas llevan "domain"; las antiguas se asignan por nombre.
-STATE_MINE_JQ='def mine($zid; $d):
+# Los nombres se comparan en forma canonica (minusculas, sin punto final).
+STATE_MINE_JQ="${CANON_JQ}"'def mine($zid; $d):
     .zone_id == $zid
-    and ((.domain // null) == $d
-         or ((.domain // null) == null and (.name == $d or (.name | endswith("." + $d)))));'
+    and ((.domain // null) as $sd
+         | if $sd != null then ($sd | canon) == $d
+           else ((.name // "") | canon) as $n | ($n == $d or ($n | endswith("." + $d)))
+           end);'
 
 dig_short() {
     dig +short +time=2 +tries=1 "$@" 2>/dev/null || true
@@ -276,7 +280,8 @@ domain_state_count() {
 # Formato actual: {"dominio": ["ip", ...]}. Formato antiguo: ["ip", ...].
 read_ips_file() {
     if [[ -f "$CF_IPS_FILE" ]] && [[ -s "$CF_IPS_FILE" ]]; then
-        jq -c '.' "$CF_IPS_FILE" 2>/dev/null || echo '{}'
+        jq -c "${CANON_JQ}"' if type == "object" then with_entries(.key |= canon) else . end' \
+            "$CF_IPS_FILE" 2>/dev/null || echo '{}'
     else
         echo '{}'
     fi
@@ -312,7 +317,8 @@ forget_ips_for() {
 # Leer el archivo de marcas de libre ({} si no existe o esta corrupto)
 read_clear_file() {
     if [[ -f "$CLEAR_FILE" ]] && [[ -s "$CLEAR_FILE" ]]; then
-        jq -c 'if type == "object" then . else {} end' "$CLEAR_FILE" 2>/dev/null || echo '{}'
+        jq -c "${CANON_JQ}"' if type == "object" then with_entries(.key |= canon) else {} end' \
+            "$CLEAR_FILE" 2>/dev/null || echo '{}'
     else
         echo '{}'
     fi
@@ -355,7 +361,7 @@ for entry in "${DOMAIN_LIST[@]}"; do
     entry="$(echo "$entry" | xargs)"
     [[ -z "$entry" ]] && continue
     zone_id="${entry%%:*}"
-    domain="${entry#*:}"
+    domain="$(canon_name "${entry#*:}")"
     if [[ "$entry" != *:* || -z "$zone_id" || -z "$domain" ]]; then
         log "ERROR" "Entrada mal formada en DOMAINS: '$entry'. Formato: ZONE_ID:DOMINIO"
         continue
@@ -447,7 +453,7 @@ disable_domain() {
     fi
 
     local records_json target_records record_count i record record_id record_name
-    local record_type record_content record_ttl body new_state
+    local record_type record_content body new_state
 
     records_json="$(cf_api GET "/zones/${zone_id}/dns_records?per_page=100")" || {
         log "ERROR" "No se pudieron obtener registros DNS para $domain. Saltando."
@@ -457,9 +463,10 @@ disable_domain() {
 
     # Solo registros proxied del dominio y subdominios. Los read-only (p.ej.
     # creados por un Worker) no se pueden editar: Cloudflare responde 400/1043
-    target_records="$(echo "$records_json" | jq -c --arg domain "$domain" '
+    target_records="$(echo "$records_json" | jq -c --arg domain "$domain" "${CANON_JQ}"'
         [.result[]
          | select(.type == "A" or .type == "AAAA" or .type == "CNAME")
+         | .name |= canon
          | select(.name == $domain or (.name | endswith("." + $domain)))
          | select(.proxiable == true)
          | select(.proxied == true)
@@ -483,7 +490,6 @@ disable_domain() {
         record_name="$(echo "$record" | jq -r '.name')"
         record_type="$(echo "$record" | jq -r '.type')"
         record_content="$(echo "$record" | jq -r '.content')"
-        record_ttl="$(echo "$record" | jq '.ttl')"
 
         # PROTECCION: nunca deshabilitar proxy en dominios protegidos
         if is_protected_domain "$record_name"; then
@@ -491,13 +497,8 @@ disable_domain() {
             continue
         fi
 
-        body="$(jq -n \
-            --arg name "$record_name" \
-            --arg type "$record_type" \
-            --arg content "$record_content" \
-            --argjson ttl "$record_ttl" \
-            '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: false}'
-        )"
+        # Solo el estado del proxy: nunca reescribir nombre, contenido o TTL
+        body='{"proxied":false}'
 
         # Si ya esta en state file pero vuelve a estar proxied, alguien (o algo)
         # ha reactivado la nube naranja durante el bloqueo: hay que volver a
@@ -547,7 +548,7 @@ enable_domain() {
     log "INFO" "=== REHABILITANDO proxy de Cloudflare: $domain (zona: ${zone_id:0:8}...) ==="
 
     local state_records record_count i record_id record_name record_type
-    local record_content record_ttl current current_proxied body new_state remaining
+    local record_content current current_proxied current_name body new_state remaining
 
     state_records="$(read_state | jq -c --arg zid "$zone_id" --arg d "$domain" \
         "$STATE_MINE_JQ"' [.[] | select(mine($zid; $d))]')"
@@ -573,15 +574,14 @@ enable_domain() {
         else
             record_type="$(echo "$current" | jq -r '.result.type')"
             record_content="$(echo "$current" | jq -r '.result.content')"
-            record_ttl="$(echo "$current" | jq '.result.ttl')"
 
-            body="$(jq -n \
-                --arg name "$record_name" \
-                --arg type "$record_type" \
-                --arg content "$record_content" \
-                --argjson ttl "$record_ttl" \
-                '{name: $name, type: $type, content: $content, ttl: $ttl, proxied: true}'
-            )"
+            # Solo el estado del proxy: un registro renombrado mientras estaba
+            # en gris conserva su nombre nuevo
+            current_name="$(echo "$current" | jq -r "${CANON_JQ}"' (.result.name // "") | canon')"
+            if [[ "$current_name" != "$(canon_name "$record_name")" ]]; then
+                log "WARN" "  $record_name ahora se llama $current_name. Se restaura el proxy sin tocar el nombre."
+            fi
+            body='{"proxied":true}'
 
             if cf_api PATCH "/zones/${zone_id}/dns_records/${record_id}" "$body" >/dev/null; then
                 log "INFO" "  [OK] Proxy rehabilitado: $record_type $record_name"
