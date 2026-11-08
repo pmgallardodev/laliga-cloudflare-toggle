@@ -7,9 +7,10 @@ set -euo pipefail
 # los bloqueos de LaLiga detectados por hayahora.futbol
 #
 # Disenado para ser crash-safe e idempotente:
-# - State file se escribe incrementalmente (tras cada PATCH)
-# - Lock file previene ejecuciones concurrentes
-# - Re-ejecucion tras crash retoma donde se quedo
+# - La intencion se escribe en el state ANTES de cada PATCH ("pending") y se
+#   confirma despues; la siguiente ejecucion reconcilia lo que quedo a medias
+# - Lock atomico (mkdir) previene ejecuciones concurrentes
+# - Ficheros corruptos van a cuarentena, nunca se tratan como vacios
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

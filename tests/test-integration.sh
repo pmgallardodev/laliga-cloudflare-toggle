@@ -758,6 +758,21 @@ t_log_rotation() {
     ok "LOG_MAX_BYTES invalido avisa" 'grep -q "WARN.*LOG_MAX_BYTES" "$LOG"'
 }
 
+# --- DRY_RUN nunca escribe ni hace PATCH ---------------------------------------------
+
+t_dry_run_never_writes() {
+    setup dry-run-never-writes
+    feed 104.21.13.229:ISP
+    run_app DRY_RUN=true
+    ok "DRY_RUN bloqueado: sin PATCH ni state" '[[ $(grep -c "^PATCH " "${HDATA}/calls.log") == 0 && ! -f $STATE && ! -f $IPS ]]'
+    setup dry-run-pending
+    pending_state r1 example.test
+    records "[$(rec r1 example.test false)]"
+    feed
+    run_app DRY_RUN=true MIN_CLEAR_MINUTES=0
+    ok "DRY_RUN con pending y libre: no reconcilia ni restaura" '[[ $(grep -c "^PATCH " "${HDATA}/calls.log") == 0 && $(state_status r1) == pending ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
