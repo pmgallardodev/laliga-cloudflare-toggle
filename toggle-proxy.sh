@@ -63,33 +63,121 @@ log() {
     { printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null || true
 }
 
+# Enviar un mensaje a Telegram. Devuelve 0 si se entrego, 1 si conviene
+# reintentar (red, 429, 5xx, respuesta ilegible; deja retry_after en
+# TG_RETRY_AFTER) y 2 si Telegram lo rechaza para siempre (p.ej. 400).
+TG_RETRY_AFTER=0
+send_telegram() {
+    local message="$1" payload response tg_ok tg_code tg_desc retry
+    TG_RETRY_AFTER=0
+    # Cuerpo JSON (no -d campo=valor): un "&" en el texto no puede partir
+    # el mensaje en campos de formulario extra
+    payload="$(telegram_payload "$TELEGRAM_CHAT_ID" "$message")" || {
+        log "WARN" "No se pudo construir la notificacion de Telegram"
+        return 2
+    }
+    response="$(curl -s --max-time 10 \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -H 'Content-Type: application/json' \
+        --data-binary "$payload" 2>/dev/null)" || {
+        log "WARN" "No se pudo enviar notificacion de Telegram (error de red). Se reintentara."
+        return 1
+    }
+    tg_ok="$(printf '%s' "$response" | jq -r '.ok' 2>/dev/null || true)"
+    [[ "$tg_ok" == "true" ]] && return 0
+    tg_code="$(printf '%s' "$response" | jq -r '.error_code // empty' 2>/dev/null || true)"
+    tg_desc="$(printf '%s' "$response" | jq -r '.description // empty' 2>/dev/null || true)"
+    retry="$(printf '%s' "$response" | jq -r '.parameters.retry_after // empty' 2>/dev/null || true)"
+    if [[ "$tg_code" =~ ^4[0-9][0-9]$ && "$tg_code" != 429 ]]; then
+        log "ERROR" "Telegram rechazo la notificacion: ${tg_desc:-HTTP $tg_code}. Se descarta."
+        return 2
+    fi
+    TG_RETRY_AFTER="$(parse_uint "$retry" 0 86400 || echo 0)"
+    log "ERROR" "Telegram rechazo la notificacion: ${tg_desc:-respuesta no valida: ${response:0:200}}. Se reintentara."
+    return 1
+}
+
+# --- Bandeja de salida: mensajes pendientes de reenviar ----------------------
+# [{hash, text, created_at, attempts, next_at}], deduplicada por hash del
+# texto y limitada a OUTBOX_MAX (se descartan los mas antiguos).
+OUTBOX_FILE="${STATE_FILE%.json}_outbox.json"
+OUTBOX_MAX=20
+# Tras un 429 en esta ejecucion no se insiste: lo nuevo va a la bandeja
+TG_BLOCKED_UNTIL=0
+
+read_outbox() {
+    if [[ -s "$OUTBOX_FILE" ]]; then
+        jq -c 'if type == "array" then . else [] end' "$OUTBOX_FILE" 2>/dev/null || echo '[]'
+    else
+        echo '[]'
+    fi
+}
+
+outbox_add() { # <texto> <next_at>
+    local hash new dropped
+    hash="$(printf '%s' "$1" | cksum | tr ' ' '-')"
+    new="$(read_outbox | jq -c --arg h "$hash" --arg t "$1" --argjson now "$(date +%s)" \
+        --argjson next "$2" --argjson max "$OUTBOX_MAX" '
+        if any(.[]; .hash == $h) then .
+        else . + [{hash: $h, text: $t, created_at: $now, attempts: 1, next_at: $next}] end
+        | .[(if length > $max then length - $max else 0 end):]')" || return 1
+    dropped=$(( $(read_outbox | jq 'length') + 1 - $(printf '%s' "$new" | jq 'length') ))
+    if [[ "$dropped" -gt 0 ]] && ! read_outbox | jq -e --arg h "$hash" 'any(.[]; .hash == $h)' >/dev/null; then
+        log "WARN" "Bandeja de Telegram llena ($OUTBOX_MAX): se descarta el mensaje pendiente mas antiguo."
+    fi
+    atomic_write "$OUTBOX_FILE" "$new"
+}
+
 notify_telegram() {
-    local message="$1"
-    if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
-        # Cuerpo JSON (no -d campo=valor): un "&" en el texto no puede partir
-        # el mensaje en campos de formulario extra
-        local payload
-        payload="$(telegram_payload "$TELEGRAM_CHAT_ID" "$message")" || {
-            log "WARN" "No se pudo construir la notificacion de Telegram"
-            return 0
-        }
-        # Capturar la respuesta: Telegram contesta HTTP 400 con ok=false (p.ej.
-        # mensaje > 4096 caracteres) y antes se perdia sin dejar rastro
-        local response tg_ok tg_desc
-        response="$(curl -s --max-time 10 \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -H 'Content-Type: application/json' \
-            --data-binary "$payload" 2>/dev/null)" || {
-            log "WARN" "No se pudo enviar notificacion de Telegram (error de red)"
-            return 0
-        }
-        tg_ok="$(printf '%s' "$response" | jq -r '.ok' 2>/dev/null || true)"
-        if [[ "$tg_ok" != "true" ]]; then
-            tg_desc="$(printf '%s' "$response" | jq -r '.description // empty' 2>/dev/null || true)"
-            log "ERROR" "Telegram rechazo la notificacion: ${tg_desc:-respuesta no valida: ${response:0:200}}"
-        fi
+    local message="$1" now rc=0
+    [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]] || return 0
+    now="$(date +%s)"
+    if [[ "$now" -lt "$TG_BLOCKED_UNTIL" ]]; then
+        outbox_add "$message" "$TG_BLOCKED_UNTIL" || log "ERROR" "No se pudo guardar la notificacion en la bandeja"
+        return 0
+    fi
+    send_telegram "$message" || rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+        TG_BLOCKED_UNTIL=$(( now + TG_RETRY_AFTER ))
+        [[ "$TG_RETRY_AFTER" -gt 0 ]] || TG_BLOCKED_UNTIL=$(( now + 1 ))
+        outbox_add "$message" "$(( now + TG_RETRY_AFTER ))" || log "ERROR" "No se pudo guardar la notificacion en la bandeja"
     fi
     return 0
+}
+
+# Reenviar la bandeja al empezar (en orden). Se para en el primer fallo
+# reintentable para respetar retry_after; los rechazos definitivos se tiran.
+flush_outbox() {
+    [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" && -s "$OUTBOX_FILE" ]] || return 0
+    local outbox n i entry text next_at now rc keep="[]" stop=false
+    outbox="$(read_outbox)"
+    n="$(printf '%s' "$outbox" | jq 'length')"
+    [[ "$n" -gt 0 ]] || { rm -f "$OUTBOX_FILE"; return 0; }
+    log "INFO" "Reenviando $n notificacion(es) pendiente(s) de Telegram"
+    for (( i = 0; i < n; i++ )); do
+        entry="$(printf '%s' "$outbox" | jq -c ".[$i]")"
+        now="$(date +%s)"
+        next_at="$(printf '%s' "$entry" | jq -r '.next_at // 0')"
+        next_at="$(parse_uint "$next_at" 0 9999999999 || echo 0)"
+        if [[ "$stop" == "true" || "$now" -lt "$next_at" ]]; then
+            keep="$(printf '%s' "$keep" | jq -c --argjson e "$entry" '. + [$e]')"
+            continue
+        fi
+        text="$(printf '%s' "$entry" | jq -r '.text // empty')"
+        rc=0
+        [[ -n "$text" ]] && { send_telegram "$text" || rc=$?; }
+        if [[ "$rc" -eq 1 ]]; then
+            stop=true
+            TG_BLOCKED_UNTIL=$(( now + (TG_RETRY_AFTER > 0 ? TG_RETRY_AFTER : 1) ))
+            keep="$(printf '%s' "$keep" | jq -c --argjson e "$entry" --argjson next "$(( now + TG_RETRY_AFTER ))" \
+                '. + [$e | .attempts = ((.attempts // 0) + 1) | .next_at = $next]')"
+        fi
+    done
+    if [[ "$(printf '%s' "$keep" | jq 'length')" -eq 0 ]]; then
+        rm -f "$OUTBOX_FILE"
+    else
+        atomic_write "$OUTBOX_FILE" "$keep" || log "ERROR" "No se pudo actualizar la bandeja de Telegram"
+    fi
 }
 
 # Comprobar si un registro DNS pertenece a un dominio protegido
@@ -539,6 +627,10 @@ quarantine_if_invalid "$CF_IPS_FILE" \
     '(type == "array" and all(.[]; type == "string"))
      or (type == "object" and all(.[]; type == "array" and all(.[]; type == "string")))'
 quarantine_if_invalid "$CLEAR_FILE" 'type == "object"'
+quarantine_if_invalid "$OUTBOX_FILE" 'type == "array" and all(.[]; type == "object")'
+if [[ "$DRY_RUN" != "true" ]]; then
+    flush_outbox
+fi
 if state_quarantine_exists; then
     log "WARN" "Hay un state en cuarentena (${STATE_FILE}.corrupt-*). Revisa en Cloudflare los registros en gris y borralo despues; mientras exista no se borran los ficheros de apoyo."
 fi

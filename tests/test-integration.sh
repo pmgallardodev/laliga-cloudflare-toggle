@@ -615,6 +615,77 @@ t_no_partial_warning_when_complete() {
     ok "sin avisos si la mitigacion es completa" 'tg_texts | grep -q DESHABILITADO && ! tg_texts | grep -q "parcial"'
 }
 
+# --- T19: bandeja de salida de notificaciones -----------------------------------------
+
+TG_429='{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}'
+outbox_len() { jq length "$OUTBOX" 2>/dev/null || echo 0; }
+
+t_outbox_retries_after_429() {
+    setup outbox-429
+    feed 104.21.13.229:ISP
+    echo "$TG_429" > "${HDATA}/tg_response.json"
+    run_app
+    ok "429 se registra y el mensaje va a la bandeja" 'out_has "ERROR.*Too Many Requests" && [[ $(outbox_len) == 1 ]]'
+    rm -f "${HDATA}/tg_response.json"
+    set_now 2000000005
+    run_app
+    ok "la siguiente ejecucion lo reenvia aunque no haya cambios" '[[ $(tg_count) == 1 ]] && tg_texts | grep -q DESHABILITADO'
+    ok "y vacia la bandeja" '[[ $(outbox_len) == 0 ]]'
+}
+
+t_outbox_honours_retry_after() {
+    setup outbox-retry-after
+    feed 104.21.13.229:ISP
+    echo '{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":600}}' > "${HDATA}/tg_response.json"
+    run_app
+    rm -f "${HDATA}/tg_response.json"
+    set_now 2000000060
+    run_app
+    ok "no reintenta antes de retry_after" '[[ $(tg_count) == 0 && $(outbox_len) == 1 ]]'
+    set_now 2000000600
+    run_app
+    ok "reintenta pasado retry_after" '[[ $(tg_count) == 1 && $(outbox_len) == 0 ]]'
+}
+
+t_outbox_deduplicates() {
+    setup outbox-dedupe
+    feed 104.21.13.229:ISP
+    echo "${TG_429/\"retry_after\":1/\"retry_after\":0}" > "${HDATA}/tg_response.json"
+    run_app
+    # El mismo evento otra vez: registro con proxy y sin state
+    records "[$(rec r1 example.test true)]"
+    rm -f "$STATE"
+    run_app
+    ok "un mensaje identico no se duplica en la bandeja" '[[ $(outbox_len) == 1 ]]'
+}
+
+t_outbox_capped() {
+    setup outbox-cap
+    jq -n '[range(20) | {hash: "h\(.)", text: "viejo \(.)", created_at: 1, attempts: 1, next_at: 9999999999}]' > "$OUTBOX"
+    feed 104.21.13.229:ISP
+    echo "$TG_429" > "${HDATA}/tg_response.json"
+    run_app
+    ok "bandeja limitada a 20 descartando el mas antiguo" '[[ $(outbox_len) == 20 && $(jq -r ".[0].hash" "$OUTBOX") == h1 ]] && out_has "WARN.*Bandeja"'
+}
+
+t_outbox_drops_permanent_400() {
+    setup outbox-400
+    feed 104.21.13.229:ISP
+    echo '{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}' > "${HDATA}/tg_response.json"
+    run_app
+    ok "un 400 se registra y no va a la bandeja" 'out_has "ERROR.*chat not found" && [[ $(outbox_len) == 0 ]]'
+    jq -n '[{hash: "x", text: "pendiente", created_at: 1, attempts: 1, next_at: 0}]' > "$OUTBOX"
+    run_app
+    ok "un 400 al reenviar descarta la entrada" '[[ $(outbox_len) == 0 ]] && out_has "descarta"'
+}
+
+t_outbox_dry_run_untouched() {
+    setup outbox-dry-run
+    jq -n '[{hash: "x", text: "pendiente", created_at: 1, attempts: 1, next_at: 0}]' > "$OUTBOX"
+    run_app DRY_RUN=true
+    ok "DRY_RUN no envia ni toca la bandeja" '[[ $(tg_count) == 0 && $(outbox_len) == 1 ]]'
+}
+
 # --- Ejecutar -----------------------------------------------------------------
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do
